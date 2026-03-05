@@ -248,7 +248,7 @@ fn image_to_tensor(image: &DynamicImage) -> Array4<f32> {
 fn pad_tensor(tensor: Array4<f32>, padding: (u32, u32, u32, u32)) -> Array4<f32> {
 	let (pl, pt, pr, pb) = padding;
 	let [batch, ch, h, w] = *tensor.shape() else {
-		unreachable!()
+		unreachable!("Array4 is always 4-dimensional")
 	};
 	let nh = h + pt as usize + pb as usize;
 	let nw = w + pl as usize + pr as usize;
@@ -268,7 +268,7 @@ fn pad_tensor(tensor: Array4<f32>, padding: (u32, u32, u32, u32)) -> Array4<f32>
 /// Crop padding from a tensor.
 fn crop_tensor(tensor: ArrayView4<f32>, pl: u32, pt: u32, pr: u32, pb: u32) -> Array4<f32> {
 	let [_b, _c, h, w] = *tensor.shape() else {
-		unreachable!()
+		unreachable!("ArrayView4 is always 4-dimensional")
 	};
 	let ch = h - pt as usize - pb as usize;
 	let cw = w - pl as usize - pr as usize;
@@ -316,7 +316,7 @@ fn accumulate_tile(
 /// Divide accumulated pixel values by their total weight.
 fn normalize_canvas(canvas: &mut Array4<f32>, weights: &Array2<f32>) {
 	let [_, _, h, w] = *canvas.shape() else {
-		unreachable!()
+		unreachable!("Array4 is always 4-dimensional")
 	};
 	for c in 0..3 {
 		for y in 0..h {
