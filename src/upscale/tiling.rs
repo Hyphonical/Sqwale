@@ -17,7 +17,7 @@ pub struct TileConfig {
 impl Default for TileConfig {
 	fn default() -> Self {
 		Self {
-			tile_size: 1024,
+			tile_size: 512,
 			overlap: 16,
 		}
 	}
@@ -42,18 +42,15 @@ pub fn compute_tile_grid(
 	config: &TileConfig,
 ) -> Result<Vec<Tile>> {
 	let scale = model_info.scale;
-
-	// Determine effective tile size
 	let mut tile_size = config.tile_size;
 
-	// For fixed-size models, use the model's required size
+	// Fixed-size models use their own tile size, no overlap
 	if let Some((h, w)) = model_info.tile.fixed_size {
 		tile_size = h.min(w) as u32;
-		// Fixed models don't use overlap (padding-based approach instead)
 		return compute_fixed_tiles(image_width, image_height, tile_size, scale);
 	}
 
-	// Apply alignment requirements
+	// Apply alignment
 	if let Some(align) = model_info.tile.alignment {
 		let r = tile_size % align;
 		if r != 0 {
@@ -61,7 +58,7 @@ pub fn compute_tile_grid(
 		}
 	}
 
-	// Check if image fits in a single tile (no tiling needed)
+	// Small image → single tile
 	if image_width <= tile_size && image_height <= tile_size {
 		let padding = (
 			0,
@@ -76,23 +73,23 @@ pub fn compute_tile_grid(
 		}]);
 	}
 
-	// Compute tile grid
 	let overlap = config.overlap;
 	let step = tile_size.saturating_sub(2 * overlap);
 
-	anyhow::ensure!(step > 0, "Tile size too small for overlap");
+	anyhow::ensure!(
+		step > 0,
+		"Tile size ({tile_size}) is too small for overlap ({overlap})"
+	);
 
 	let cols = image_width.div_ceil(step).max(1);
 	let rows = image_height.div_ceil(step).max(1);
-
-	let mut tiles = Vec::new();
+	let mut tiles = Vec::with_capacity((cols * rows) as usize);
 
 	for row in 0..rows {
 		for col in 0..cols {
 			let x = col * step;
 			let y = row * step;
 
-			// Calculate actual tile dimensions with overlap
 			let tile_w = if col == cols - 1 {
 				image_width.saturating_sub(x)
 			} else {
@@ -105,19 +102,12 @@ pub fn compute_tile_grid(
 				tile_size.min(image_height.saturating_sub(y))
 			};
 
-			// Padding to reach tile_size (or aligned size)
-			let pad_right = tile_size.saturating_sub(tile_w);
-			let pad_bottom = tile_size.saturating_sub(tile_h);
-
-			// Apply alignment to padded dimensions
 			let (final_w, final_h) = if let Some(align) = model_info.tile.alignment {
-				let w = tile_w + pad_right;
-				let h = tile_h + pad_bottom;
-				let aligned_w = w.div_ceil(align) * align;
-				let aligned_h = h.div_ceil(align) * align;
-				(aligned_w, aligned_h)
+				let aw = (tile_w).div_ceil(align) * align;
+				let ah = (tile_h).div_ceil(align) * align;
+				(aw, ah)
 			} else {
-				(tile_w + pad_right, tile_h + pad_bottom)
+				(tile_size, tile_size)
 			};
 
 			let pad_right = final_w.saturating_sub(tile_w);
@@ -143,24 +133,19 @@ fn compute_fixed_tiles(
 ) -> Result<Vec<Tile>> {
 	let cols = image_width.div_ceil(tile_size);
 	let rows = image_height.div_ceil(tile_size);
-
-	let mut tiles = Vec::new();
+	let mut tiles = Vec::with_capacity((cols * rows) as usize);
 
 	for row in 0..rows {
 		for col in 0..cols {
 			let x = col * tile_size;
 			let y = row * tile_size;
-
 			let tile_w = tile_size.min(image_width.saturating_sub(x));
 			let tile_h = tile_size.min(image_height.saturating_sub(y));
-
-			let pad_right = tile_size.saturating_sub(tile_w);
-			let pad_bottom = tile_size.saturating_sub(tile_h);
 
 			tiles.push(Tile {
 				src_rect: (x, y, tile_w, tile_h),
 				dst_rect: (x * scale, y * scale, tile_w * scale, tile_h * scale),
-				padding: (0, 0, pad_right, pad_bottom),
+				padding: (0, 0, tile_size - tile_w, tile_size - tile_h),
 			});
 		}
 	}
@@ -170,49 +155,40 @@ fn compute_fixed_tiles(
 
 /// Generate cosine blending weights for a tile.
 ///
-/// Returns a 2D weight map where edges fade using cosine window.
-pub fn generate_blend_weights(
-	tile_width: u32,
-	tile_height: u32,
-	overlap: u32,
-) -> Result<Array2<f32>> {
+/// Edges within the overlap zone fade using a cosine window so that
+/// adjacent tiles blend smoothly.
+pub fn generate_blend_weights(tile_width: u32, tile_height: u32, overlap: u32) -> Array2<f32> {
 	let h = tile_height as usize;
 	let w = tile_width as usize;
-	let overlap = overlap as usize;
+	let ov = overlap as usize;
 
 	let mut weights = Array2::<f32>::ones((h, w));
 
-	// Apply cosine window on all edges
 	for y in 0..h {
 		for x in 0..w {
-			let mut weight_x: f32 = 1.0;
-			let mut weight_y: f32 = 1.0;
+			let mut wx: f32 = 1.0;
+			let mut wy: f32 = 1.0;
 
-			// Left edge
-			if x < overlap {
-				let t = x as f32 / overlap as f32;
-				weight_x = weight_x.min(0.5 * (1.0 - (std::f32::consts::PI * t).cos()));
+			if x < ov {
+				let t = x as f32 / ov as f32;
+				wx = wx.min(0.5 * (1.0 - (std::f32::consts::PI * t).cos()));
 			}
-			// Right edge
-			if x >= w - overlap {
-				let t = (w - 1 - x) as f32 / overlap as f32;
-				weight_x = weight_x.min(0.5 * (1.0 - (std::f32::consts::PI * t).cos()));
+			if x >= w.saturating_sub(ov) {
+				let t = (w.saturating_sub(1) - x) as f32 / ov as f32;
+				wx = wx.min(0.5 * (1.0 - (std::f32::consts::PI * t).cos()));
 			}
-
-			// Top edge
-			if y < overlap {
-				let t = y as f32 / overlap as f32;
-				weight_y = weight_y.min(0.5 * (1.0 - (std::f32::consts::PI * t).cos()));
+			if y < ov {
+				let t = y as f32 / ov as f32;
+				wy = wy.min(0.5 * (1.0 - (std::f32::consts::PI * t).cos()));
 			}
-			// Bottom edge
-			if y >= h - overlap {
-				let t = (h - 1 - y) as f32 / overlap as f32;
-				weight_y = weight_y.min(0.5 * (1.0 - (std::f32::consts::PI * t).cos()));
+			if y >= h.saturating_sub(ov) {
+				let t = (h.saturating_sub(1) - y) as f32 / ov as f32;
+				wy = wy.min(0.5 * (1.0 - (std::f32::consts::PI * t).cos()));
 			}
 
-			weights[[y, x]] = weight_x * weight_y;
+			weights[[y, x]] = wx * wy;
 		}
 	}
 
-	Ok(weights)
+	weights
 }

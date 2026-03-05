@@ -1,14 +1,88 @@
 //! Upscale command implementation.
+//!
+//! Styled output following `sqwale_style.txt`:
+//! - `●` cyan bold   — section header / major step
+//! - `✓` green       — success
+//! - `✗` red bold    — hard error
+//! - `⚠` yellow      — warning
+//! - `·` dimmed      — sub-detail
+//!
+//! Progress bars (via `tracing-indicatif`):
+//! - Tile bar   (child span)  — top
+//! - Batch bar  (parent span) — bottom
 
 use anyhow::{Context, Result};
 use colored::Colorize;
 use glob::glob;
 use image::GenericImageView;
+use indicatif::ProgressStyle;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use tracing::info_span;
+use tracing_indicatif::span_ext::IndicatifSpanExt;
 
+use sqwale::inspect::ModelInfo;
 use sqwale::upscale::{Provider, UpscaleOptions, UpscaleSession};
+
+// ── Progress bar style ────────────────────────────────────────────────────
+
+fn tile_bar_style() -> ProgressStyle {
+	ProgressStyle::with_template("  {bar:40.cyan/black} {pos:>3}/{len} tiles  {elapsed}  {per_sec}")
+		.expect("valid tile progress bar template")
+		.progress_chars("━━╌")
+}
+
+fn batch_bar_style() -> ProgressStyle {
+	ProgressStyle::with_template("  {bar:40.cyan/black} {pos:>3}/{len}  images  {elapsed} elapsed")
+		.expect("valid batch progress bar template")
+		.progress_chars("━━╌")
+}
+
+// ── Helpers ────────────────────────────────────────────────────────────────
+
+/// Format a model summary line like: `2x · RGB · float16 · dynamic`
+fn model_summary(info: &ModelInfo) -> String {
+	let tiling = if info.tile.supported {
+		"dynamic"
+	} else {
+		"fixed"
+	};
+	format!(
+		"{}x · {} · {} · {}",
+		info.scale, info.color_space, info.input_dtype, tiling
+	)
+}
+
+/// Format duration as human-readable string.
+fn fmt_duration(secs: f64) -> String {
+	if secs < 60.0 {
+		format!("{secs:.1}s")
+	} else {
+		format!("{:.0}m {:.0}s", secs / 60.0, secs % 60.0)
+	}
+}
+
+/// Determine output path for a single image.
+fn output_path_for(input: &Path, output: Option<&Path>, scale: u32) -> PathBuf {
+	if let Some(out) = output {
+		if out.extension().is_some() {
+			return out.to_path_buf();
+		}
+		let ext = input.extension().and_then(|e| e.to_str()).unwrap_or("png");
+		return PathBuf::from(format!("{}.{ext}", out.display()));
+	}
+
+	let stem = input
+		.file_stem()
+		.and_then(|s| s.to_str())
+		.unwrap_or("output");
+	let ext = input.extension().and_then(|e| e.to_str()).unwrap_or("png");
+	let parent = input.parent().unwrap_or(Path::new("."));
+	parent.join(format!("{stem}_{scale}x.{ext}"))
+}
+
+// ── Entry point ────────────────────────────────────────────────────────────
 
 /// Run the upscale command.
 pub fn run(
@@ -18,359 +92,420 @@ pub fn run(
 	provider_str: &str,
 	quiet: bool,
 ) -> Result<()> {
-	// Setup Ctrl+C handler
 	let interrupted = Arc::new(AtomicBool::new(false));
-	let interrupted_clone = interrupted.clone();
-	ctrlc::set_handler(move || {
-		interrupted_clone.store(true, Ordering::SeqCst);
-		eprintln!(
-			"\n{} Interrupted by user. Cleaning up...",
-			"⚠".yellow().bold()
-		);
-	})
-	.context("Failed to set Ctrl+C handler")?;
+	{
+		let flag = interrupted.clone();
+		ctrlc::set_handler(move || {
+			flag.store(true, Ordering::SeqCst);
+		})
+		.context("Failed to install Ctrl+C handler")?;
+	}
 
-	// Check if input is a glob pattern
 	let has_glob = input.contains('*') || input.contains('?') || input.contains('[');
 
 	if has_glob {
-		run_batch(input, model, output, provider_str, quiet, interrupted)
+		run_batch(input, model, output, provider_str, quiet, &interrupted)
 	} else {
-		run_single(input, model, output, provider_str, quiet, interrupted)
+		run_single(input, model, output, provider_str, quiet, &interrupted)
 	}
 }
 
-/// Run upscale on a single image.
+// ── Single Image ───────────────────────────────────────────────────────────
+
 fn run_single(
 	input: &str,
 	model: &str,
 	output: Option<&str>,
 	provider_str: &str,
 	quiet: bool,
-	interrupted: Arc<AtomicBool>,
+	interrupted: &Arc<AtomicBool>,
 ) -> Result<()> {
 	let input_path = PathBuf::from(input);
-	let output_path = output.map(PathBuf::from);
-	run_single_internal(
-		&input_path,
-		model,
-		output_path.as_deref(),
-		provider_str,
-		quiet,
-		interrupted,
-		None,
-	)
-}
-
-/// Internal implementation of single image upscale.
-fn run_single_internal(
-	input_path: &Path,
-	model: &str,
-	output_path: Option<&Path>,
-	provider_str: &str,
-	quiet: bool,
-	interrupted: Arc<AtomicBool>,
-	session: Option<&mut UpscaleSession>,
-) -> Result<()> {
-	if !input_path.exists() {
-		anyhow::bail!(
-			"{} '{}'\n  {} Check the file path and ensure it exists",
-			"Input file not found:".red().bold(),
-			input_path.display().to_string().bright_white(),
-			"Hint:".yellow()
-		);
-	}
-
 	let model_path = Path::new(model);
-	if !model_path.exists() {
-		anyhow::bail!(
-			"{} '{}'\n  {} Check the model path and ensure it exists",
-			"Model file not found:".red().bold(),
-			model.bright_white(),
-			"Hint:".yellow()
-		);
-	}
+
+	validate_paths(&input_path, model_path)?;
 
 	let provider = provider_str
 		.parse::<Provider>()
-		.context("Invalid provider specified")?;
+		.context("Invalid execution provider")?;
 
-	let options = UpscaleOptions {
-		provider,
-		tile_size: None, // Auto-calculate
-		overlap: 16,     // Default overlap
-	};
-
-	let mut owned_session;
-	let session_ref = if let Some(s) = session {
-		s
-	} else {
-		if !quiet {
-			eprintln!(
-				"{} Loading model {}",
-				"→".bright_blue(),
-				model_path.display().to_string().bright_white()
-			);
-		}
-		owned_session = UpscaleSession::new(model_path, &options)?;
-		&mut owned_session
-	};
+	let options = UpscaleOptions { provider };
+	let mut session = UpscaleSession::new(model_path, &options)?;
+	let info = session.model_info().clone();
 
 	if !quiet {
-		let info = session_ref.model_info();
 		eprintln!(
-			"{} Model: {}x upscale, {} channels, {} input",
-			"✓".green(),
-			info.scale.to_string().green(),
-			info.input_channels.to_string().cyan(),
-			info.input_dtype.bright_green()
+			"{}",
+			format!("── upscale · single image ──{:─<30}", "").dimmed()
 		);
+		eprintln!();
 		eprintln!(
-			"{} Loading image {}",
-			"→".bright_blue(),
+			"{} {}",
+			"●".cyan().bold(),
 			input_path.display().to_string().bright_white()
 		);
+		eprintln!(
+			"{}",
+			format!(
+				"  · Model   {}  {} via {}",
+				model_summary(&info).cyan(),
+				model_path
+					.file_name()
+					.and_then(|n| n.to_str())
+					.unwrap_or("unknown"),
+				session.provider()
+			)
+			.dimmed()
+		);
 	}
 
-	let input_image = image::open(input_path)
-		.with_context(|| format!("Failed to load image: {}", input_path.display()))?;
+	let input_image = image::open(&input_path)
+		.with_context(|| format!("Failed to decode image '{}'", input_path.display()))?;
 
-	let (orig_width, orig_height) = input_image.dimensions();
+	let (w, h) = input_image.dimensions();
 	if !quiet {
 		eprintln!(
-			"{} Input: {}×{} pixels",
-			"✓".green(),
-			orig_width.to_string().cyan(),
-			orig_height.to_string().cyan()
+			"{}",
+			format!(
+				"  · Input   {}×{}",
+				w.to_string().bright_white().bold(),
+				h.to_string().bright_white().bold()
+			)
+			.dimmed()
 		);
-		eprintln!("{} Upscaling...", "→".bright_blue());
 	}
 
-	// Check for interruption before starting
 	if interrupted.load(Ordering::SeqCst) {
-		anyhow::bail!("{} Operation cancelled", "✗".red());
+		anyhow::bail!("Cancelled before upscaling started");
 	}
 
-	let upscaled = session_ref.upscale(input_image)?;
-	let (new_width, new_height) = upscaled.dimensions();
+	let start = std::time::Instant::now();
+
+	// Create a tracing span for the tile progress bar
+	let tile_span = info_span!("tiles");
+	tile_span.pb_set_style(&tile_bar_style());
+	let _tile_guard = tile_span.enter();
+
+	let upscaled = session.upscale(input_image, |done, total| {
+		if done == 1 {
+			tile_span.pb_set_length(total as u64);
+		}
+		tile_span.pb_set_position(done as u64);
+	})?;
+
+	drop(_tile_guard);
+
+	let elapsed = start.elapsed().as_secs_f64();
+	let (ow, oh) = upscaled.dimensions();
 
 	if !quiet {
 		eprintln!(
-			"{} Output: {}×{} pixels",
-			"✓".green(),
-			new_width.to_string().cyan(),
-			new_height.to_string().cyan()
+			"{}",
+			format!(
+				"  · Output  {}×{}",
+				ow.to_string().bright_white().bold(),
+				oh.to_string().bright_white().bold()
+			)
+			.dimmed()
 		);
 	}
 
-	let final_output_path = match output_path {
-		Some(p) => p.to_path_buf(),
-		None => determine_output_path(input_path, None, &upscaled)?,
-	};
-
-	if !quiet {
-		eprintln!(
-			"{} Saving to {}",
-			"→".bright_blue(),
-			final_output_path.display().to_string().bright_white()
-		);
+	let out = output_path_for(&input_path, output.map(Path::new), info.scale);
+	if let Some(parent) = out.parent() {
+		if !parent.exists() {
+			std::fs::create_dir_all(parent).with_context(|| {
+				format!("Failed to create output directory '{}'", parent.display())
+			})?;
+		}
 	}
 
 	upscaled
-		.save(&final_output_path)
-		.with_context(|| format!("Failed to save image: {}", final_output_path.display()))?;
+		.save(&out)
+		.with_context(|| format!("Failed to save output image '{}'", out.display()))?;
 
 	if !quiet {
-		eprintln!("{} Done!", "✓".green().bold());
+		eprintln!(
+			"{} {}  {}",
+			"✓".green(),
+			out.display().to_string().bright_white(),
+			fmt_duration(elapsed).dimmed()
+		);
 	}
 
 	Ok(())
 }
 
-/// Determine output path based on user input and source format.
-fn determine_output_path(
-	input_path: &Path,
-	output: Option<&str>,
-	_upscaled: &image::DynamicImage,
-) -> Result<PathBuf> {
-	let output_path = match output {
-		Some(out) => {
-			let out_path = Path::new(out);
-			if out_path.extension().is_some() {
-				// Has extension, use as-is
-				out_path.to_path_buf()
-			} else {
-				// No extension, use source format
-				let source_ext = input_path
-					.extension()
-					.and_then(|e| e.to_str())
-					.unwrap_or("png");
-				PathBuf::from(format!("{}.{}", out, source_ext))
-			}
-		}
-		None => {
-			// Default: input_upscaled.ext in same directory
-			let stem = input_path
-				.file_stem()
-				.and_then(|s| s.to_str())
-				.unwrap_or("output");
-			let ext = input_path
-				.extension()
-				.and_then(|e| e.to_str())
-				.unwrap_or("png");
-			let parent = input_path.parent().unwrap_or(Path::new("."));
-			parent.join(format!("{}_upscaled.{}", stem, ext))
-		}
-	};
+// ── Batch ──────────────────────────────────────────────────────────────────
 
-	Ok(output_path)
-}
-
-/// Run upscale on a batch of images matching a glob pattern.
 fn run_batch(
 	pattern: &str,
 	model: &str,
 	output_dir: Option<&str>,
 	provider_str: &str,
 	quiet: bool,
-	interrupted: Arc<AtomicBool>,
+	interrupted: &Arc<AtomicBool>,
 ) -> Result<()> {
-	// Find matching files
+	let model_path = Path::new(model);
+	if !model_path.exists() {
+		anyhow::bail!("Model file not found: '{model}'");
+	}
+
 	let matches: Vec<PathBuf> = glob(pattern)
-		.context("Invalid glob pattern")?
+		.with_context(|| format!("Invalid glob pattern '{pattern}'"))?
 		.filter_map(Result::ok)
 		.filter(|p| p.is_file())
 		.collect();
 
 	if matches.is_empty() {
-		anyhow::bail!(
-			"{} No files matched pattern: {}\n  {} Try a different pattern like *.jpg or images/*.png",
-			"No matches:".red().bold(),
-			pattern.bright_white(),
-			"Hint:".yellow()
-		);
+		anyhow::bail!("No files matched pattern '{pattern}'");
 	}
 
-	if !quiet {
-		eprintln!(
-			"{} Found {} image(s) matching pattern",
-			"✓".green(),
-			matches.len().to_string().cyan()
-		);
-	}
+	let provider = provider_str
+		.parse::<Provider>()
+		.context("Invalid execution provider")?;
 
-	// Determine output directory
+	let options = UpscaleOptions { provider };
+	let mut session = UpscaleSession::new(model_path, &options)?;
+	let info = session.model_info().clone();
+
 	let out_dir = output_dir.map(PathBuf::from).unwrap_or_else(|| {
 		Path::new(pattern)
 			.parent()
-			.unwrap_or_else(|| Path::new("."))
+			.unwrap_or(Path::new("."))
 			.join("upscaled")
 	});
 
 	if !out_dir.exists() {
-		std::fs::create_dir_all(&out_dir)
-			.with_context(|| format!("Failed to create output directory: {}", out_dir.display()))?;
-		if !quiet {
-			eprintln!(
-				"{} Created output directory: {}",
-				"✓".green(),
-				out_dir.display().to_string().bright_white()
-			);
-		}
+		std::fs::create_dir_all(&out_dir).with_context(|| {
+			format!("Failed to create output directory '{}'", out_dir.display())
+		})?;
 	}
 
-	// Load model once
-	let model_path = Path::new(model);
-	let provider = provider_str.parse::<Provider>()?;
-	let options = UpscaleOptions {
-		provider,
-		tile_size: None,
-		overlap: 16,
-	};
+	let total = matches.len();
 
 	if !quiet {
+		eprintln!("{}", format!("── upscale · batch ──{:─<36}", "").dimmed());
+		eprintln!();
 		eprintln!(
-			"{} Loading model {}",
-			"→".bright_blue(),
-			model_path.display().to_string().bright_white()
+			"{} {}  {}",
+			"●".cyan().bold(),
+			format!("Batch: {} images", total.to_string().bright_white().bold()).white(),
+			format!("→ {}", out_dir.display()).dimmed()
 		);
+		eprintln!(
+			"{}",
+			format!("  · Model   {}", model_summary(&info).cyan()).dimmed()
+		);
+		eprintln!(
+			"{}",
+			format!(
+				"  · Loaded  {}  via {}",
+				model_path
+					.file_name()
+					.and_then(|n| n.to_str())
+					.unwrap_or("unknown"),
+				session.provider()
+			)
+			.dimmed()
+		);
+		eprintln!();
 	}
 
-	let mut session = UpscaleSession::new(model_path, &options)?;
+	// Parent span → batch progress bar (bottom)
+	let batch_span = info_span!("batch");
+	batch_span.pb_set_style(&batch_bar_style());
+	batch_span.pb_set_length(total as u64);
+	let _batch_guard = batch_span.enter();
 
-	if !quiet {
-		let info = session.model_info();
-		eprintln!(
-			"{} Model: {}x upscale, {} channels, {} input",
-			"✓".green(),
-			info.scale.to_string().green(),
-			info.input_channels.to_string().cyan(),
-			info.input_dtype.bright_green()
-		);
-	}
-
-	// Process each image
-	let mut success_count = 0;
-	let mut error_count = 0;
+	let mut ok = 0usize;
+	let mut failed: Vec<(PathBuf, String)> = Vec::new();
+	let mut skipped = 0usize;
 
 	for (idx, input_path) in matches.iter().enumerate() {
 		if interrupted.load(Ordering::SeqCst) {
-			eprintln!(
-				"\n{} Batch processing cancelled after {}/{} images",
-				"⚠".yellow().bold(),
-				idx,
-				matches.len()
-			);
+			skipped = total - idx;
+			if !quiet {
+				eprintln!();
+				eprintln!(
+					"{} {}",
+					"⚠".yellow().bold(),
+					"Interrupted — finishing current image, skipping remaining".white()
+				);
+			}
 			break;
 		}
 
+		let img_start = std::time::Instant::now();
+
 		if !quiet {
 			eprintln!(
-				"\n{} [{}/{}] Processing {}",
-				"→".bright_blue(),
-				idx + 1,
-				matches.len(),
+				"{} {} {}",
+				"●".cyan().bold(),
+				format!("[{}/{}]", idx + 1, total).dimmed(),
 				input_path.display().to_string().bright_white()
 			);
 		}
 
-		// Determine output path
-		let filename = input_path
-			.file_name()
-			.and_then(|n| n.to_str())
-			.unwrap_or("output.png");
-		let output_path = out_dir.join(filename);
-
-		match run_single_internal(
-			input_path,
-			model,
-			Some(&output_path),
-			provider_str,
-			quiet,
-			interrupted.clone(),
-			Some(&mut session),
-		) {
-			Ok(_) => success_count += 1,
+		let input_image = match image::open(input_path) {
+			Ok(img) => img,
 			Err(e) => {
-				error_count += 1;
-				eprintln!(
-					"{}  Failed to process {}: {}",
-					"✗".red(),
-					input_path.display(),
-					e
-				);
+				let msg = format!("{e:#}");
+				if !quiet {
+					eprintln!(
+						"  {} {}",
+						"✗".red(),
+						format!("Failed to decode image: {msg}").white()
+					);
+				}
+				failed.push((input_path.clone(), msg));
+				batch_span.pb_inc(1);
+				continue;
+			}
+		};
+
+		let (w, h) = input_image.dimensions();
+		if !quiet {
+			eprintln!(
+				"{}",
+				format!(
+					"  · Input   {}×{}",
+					w.to_string().bright_white().bold(),
+					h.to_string().bright_white().bold()
+				)
+				.dimmed()
+			);
+		}
+
+		// Child span → tile progress bar (top)
+		let tile_span = info_span!("tiles");
+		tile_span.pb_set_style(&tile_bar_style());
+		let tile_span_entered = tile_span.enter();
+
+		let result = session.upscale(input_image, |done, total_tiles| {
+			if done == 1 {
+				tile_span.pb_set_length(total_tiles as u64);
+			}
+			tile_span.pb_set_position(done as u64);
+		});
+
+		drop(tile_span_entered);
+
+		match result {
+			Ok(upscaled) => {
+				let (ow, oh) = upscaled.dimensions();
+				if !quiet {
+					eprintln!(
+						"{}",
+						format!(
+							"  · Output  {}×{}",
+							ow.to_string().bright_white().bold(),
+							oh.to_string().bright_white().bold()
+						)
+						.dimmed()
+					);
+				}
+
+				let out_name = input_path
+					.file_stem()
+					.and_then(|s| s.to_str())
+					.unwrap_or("output");
+				let out_ext = input_path
+					.extension()
+					.and_then(|e| e.to_str())
+					.unwrap_or("png");
+				let out_path = out_dir.join(format!("{out_name}_{s}x.{out_ext}", s = info.scale));
+
+				match upscaled.save(&out_path) {
+					Ok(()) => {
+						let elapsed = img_start.elapsed().as_secs_f64();
+						ok += 1;
+						if !quiet {
+							eprintln!(
+								"  {} {}  {}",
+								"✓".green(),
+								out_path.display().to_string().bright_white(),
+								fmt_duration(elapsed).dimmed()
+							);
+							eprintln!();
+						}
+					}
+					Err(e) => {
+						let msg = format!("Failed to save: {e:#}");
+						if !quiet {
+							eprintln!("  {} {}", "✗".red(), msg.white());
+						}
+						failed.push((input_path.clone(), msg));
+					}
+				}
+			}
+			Err(e) => {
+				let msg = format!("{e:#}");
+				if !quiet {
+					eprintln!(
+						"  {} {}",
+						"✗".red(),
+						format!("Upscale failed: {msg}").white()
+					);
+				}
+				failed.push((input_path.clone(), msg));
 			}
 		}
+
+		batch_span.pb_inc(1);
 	}
 
-	// Summary
+	drop(_batch_guard);
+
+	// ── Summary ────────────────────────────────────────────────────────────
+
 	if !quiet {
-		eprintln!("\n{} Batch complete:", "✓".green().bold());
-		eprintln!("  {} {} succeeded", "✓".green(), success_count);
-		if error_count > 0 {
-			eprintln!("  {} {} failed", "✗".red(), error_count);
+		if interrupted.load(Ordering::SeqCst) {
+			eprintln!();
+			eprintln!(
+				"{} {}",
+				"✗".red().bold(),
+				format!("Cancelled after {}/{total}", ok + failed.len()).white()
+			);
+		}
+
+		if ok > 0 {
+			eprint!(
+				"{} {} {}",
+				"✓".green(),
+				ok.to_string().bright_white().bold(),
+				"succeeded".white()
+			);
+		}
+		if !failed.is_empty() {
+			eprint!(
+				"  {}  {} {}",
+				"·".dimmed(),
+				failed.len().to_string().red(),
+				"failed".red()
+			);
+		}
+		if skipped > 0 {
+			eprint!("  {}  {} skipped", "·".dimmed(), skipped);
+		}
+		eprintln!();
+
+		// List failures
+		for (path, msg) in &failed {
+			eprintln!("  {} {}  {}", "✗".dimmed(), path.display(), msg.dimmed());
 		}
 	}
 
+	Ok(())
+}
+
+// ── Validation ─────────────────────────────────────────────────────────────
+
+fn validate_paths(input: &Path, model: &Path) -> Result<()> {
+	if !input.exists() {
+		anyhow::bail!("Input file not found: '{}'", input.display());
+	}
+	if !model.exists() {
+		anyhow::bail!("Model file not found: '{}'", model.display());
+	}
 	Ok(())
 }

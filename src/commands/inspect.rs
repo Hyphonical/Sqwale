@@ -1,4 +1,19 @@
 //! Inspect command implementation.
+//!
+//! Matches the visual style from `sqwale_style.txt`:
+//!
+//! ```text
+//! ● 2x-Model_fp16.onnx
+//!  ├─ Scale      2x  via DepthToSpace (PixelShuffle)
+//!  ├─ Color      RGB  in:3 → out:3
+//!  ├─ Precision  float16 → float16
+//!  ├─ Opset      17
+//!  ├─ Tiling     supported  dynamic spatial dims
+//!  │   └─ Alignment  divisible by 16
+//!  ╰─ Ops        866 total nodes
+//!      ├─ 180  Constant
+//!      ╰─      … 10 more op types
+//! ```
 
 use anyhow::{Context, Result};
 use colored::Colorize;
@@ -9,84 +24,78 @@ use treelog::{render_to_string, Tree};
 use sqwale::inspect::{inspect_model, ModelInfo};
 
 /// Run the inspect command on a path or glob pattern.
-pub fn run(pattern: &str, _verbose: bool, quiet: bool) -> Result<()> {
+pub fn run(pattern: &str, verbose: bool, quiet: bool) -> Result<()> {
 	let paths = collect_paths(pattern)?;
 
 	if paths.is_empty() {
-		anyhow::bail!(
-			"{}\n  {} Try: sqwale inspect path/to/models/*.onnx",
-			"No ONNX models found matching pattern".red().bold(),
-			"Hint:".yellow()
-		);
+		anyhow::bail!("No ONNX models found matching '{pattern}'");
 	}
 
-	let mut results: Vec<(PathBuf, Result<ModelInfo>)> = Vec::new();
-	let mut success_count = 0;
-	let mut error_count = 0;
+	if !quiet {
+		eprintln!("{}", format!("── inspect ──{:─<44}", "").dimmed());
+		eprintln!();
+	}
+
+	let mut ok = 0usize;
+	let mut fail = 0usize;
 
 	for path in &paths {
-		let result = inspect_model(path);
-		if result.is_ok() {
-			success_count += 1;
-		} else {
-			error_count += 1;
-		}
-		results.push((path.clone(), result));
-	}
-
-	for (path, result) in &results {
-		match result {
+		match inspect_model(path) {
 			Ok(info) => {
+				ok += 1;
 				if !quiet {
-					print_model_info(path, info);
+					print_model_info(path, &info, verbose);
 				}
 			}
 			Err(e) => {
+				fail += 1;
 				eprintln!(
 					"{} {}",
 					"✗".red().bold(),
 					path.display().to_string().bright_white()
 				);
-				eprintln!("  {}: {}", "Error".red(), e);
+				eprintln!("  {}", format!("{e:#}").dimmed());
 			}
 		}
 	}
 
-	if !quiet && (success_count > 0 || error_count > 0) {
+	if !quiet && paths.len() > 1 {
 		eprintln!();
-		eprintln!(
-			"{} {} {} model(s) inspected, {} {} failed",
-			"Summary:".bright_white().bold(),
-			success_count.to_string().green(),
-			"✓".green(),
-			error_count.to_string().red(),
-			"✗".red()
-		);
+		if ok > 0 {
+			eprint!(
+				"{} {} inspected",
+				"✓".green(),
+				ok.to_string().bright_white().bold()
+			);
+		}
+		if fail > 0 {
+			eprint!(
+				"  {}  {} {} failed",
+				"·".dimmed(),
+				"✗".red(),
+				fail.to_string().bright_white().bold()
+			);
+		}
+		eprintln!();
 	}
 
-	if error_count > 0 {
-		anyhow::bail!("{} model(s) failed inspection", error_count);
+	if fail > 0 {
+		anyhow::bail!("{fail} model(s) failed inspection");
 	}
 
 	Ok(())
 }
 
-/// Collect all .onnx file paths matching the pattern.
+// ── Path Collection ────────────────────────────────────────────────────────
+
 fn collect_paths(pattern: &str) -> Result<Vec<PathBuf>> {
 	let is_glob = pattern.contains('*') || pattern.contains('?') || pattern.contains('[');
 
 	if is_glob {
 		let paths: Vec<_> = glob(pattern)
-			.with_context(|| {
-				format!(
-					"{} '{}'\n  {} Ensure the glob pattern is valid",
-					"Invalid glob pattern:".red().bold(),
-					pattern.bright_white(),
-					"Hint:".yellow()
-				)
-			})?
+			.with_context(|| format!("Invalid glob pattern '{pattern}'"))?
 			.filter_map(|e| e.ok())
-			.filter(|p| p.extension().map(|e| e == "onnx").unwrap_or(false))
+			.filter(|p| p.extension().is_some_and(|e| e == "onnx"))
 			.collect();
 		Ok(paths)
 	} else {
@@ -94,109 +103,168 @@ fn collect_paths(pattern: &str) -> Result<Vec<PathBuf>> {
 		if p.exists() {
 			Ok(vec![p.to_path_buf()])
 		} else {
-			anyhow::bail!(
-				"{} '{}'\n  {} Check the file path and ensure it exists",
-				"File not found:".red().bold(),
-				pattern.bright_white(),
-				"Hint:".yellow()
-			);
+			anyhow::bail!("File not found: '{pattern}'");
 		}
 	}
 }
 
-/// Print model info using treelog with proper formatting and colors.
-fn print_model_info(path: &Path, info: &ModelInfo) {
+// ── Pretty Printing ───────────────────────────────────────────────────────
+
+fn print_model_info(path: &Path, info: &ModelInfo, verbose: bool) {
 	let filename = path
 		.file_name()
 		.and_then(|n| n.to_str())
-		.unwrap_or("unknown")
-		.cyan()
-		.bold();
+		.unwrap_or("unknown");
 
+	// Header
+	eprintln!("{} {}", "●".cyan().bold(), filename.bright_white().bold(),);
+
+	// Build tree children
 	let mut children = Vec::new();
 
+	// Scale
 	children.push(Tree::Node(
-		"Scale".bright_white().to_string(),
-		vec![Tree::Leaf(vec![format!(
-			"{}x ({})",
-			info.scale.to_string().green().to_string(),
-			info.scale_source.to_string().dimmed().to_string()
-		)])],
+		format!(
+			"{:<11}{}",
+			"Scale".white(),
+			format!(
+				"{}x  {}",
+				info.scale.to_string().bright_white().bold(),
+				format!("via {}", info.scale_source).dimmed()
+			)
+		),
+		vec![],
 	));
 
+	// Color
 	children.push(Tree::Node(
-		"Color Space".bright_white().to_string(),
-		vec![Tree::Leaf(vec![info
-			.color_space
-			.to_string()
-			.yellow()
-			.to_string()])],
+		format!(
+			"{:<11}{}  {}",
+			"Color".white(),
+			info.color_space.to_string().cyan(),
+			format!(
+				"in:{} → out:{}",
+				info.input_channels.to_string().bright_white().bold(),
+				info.output_channels.to_string().bright_white().bold()
+			)
+			.dimmed()
+		),
+		vec![],
 	));
 
+	// Precision
 	children.push(Tree::Node(
-		"Channels".bright_white().to_string(),
-		vec![Tree::Leaf(vec![format!(
-			"Input: {}, Output: {}",
-			info.input_channels.to_string().bright_cyan().to_string(),
-			info.output_channels.to_string().bright_cyan().to_string()
-		)])],
-	));
-
-	children.push(Tree::Node(
-		"Data Types".bright_white().to_string(),
-		vec![Tree::Leaf(vec![format!(
-			"Input: {}, Output: {}",
+		format!(
+			"{:<11}{} {} {}",
+			"Precision".white(),
 			format_dtype(&info.input_dtype),
-			format_dtype(&info.output_dtype)
-		)])],
+			"→".dimmed(),
+			format_dtype(&info.output_dtype),
+		),
+		vec![],
 	));
 
-	let mut tiling_children = Vec::new();
-	tiling_children.push(Tree::Leaf(vec![format!(
-		"Supported: {}",
-		if info.tile.supported {
-			"yes".green().to_string()
-		} else {
-			"no (fixed size)".yellow().to_string()
-		}
-	)]));
+	// Opset
+	children.push(Tree::Node(
+		format!(
+			"{:<11}{}",
+			"Opset".white(),
+			info.opset.to_string().bright_white().bold(),
+		),
+		vec![],
+	));
 
-	if let Some((h, w)) = info.tile.fixed_size {
-		tiling_children.push(Tree::Leaf(vec![format!(
-			"Fixed Size: {}×{}",
-			h.to_string().magenta().to_string(),
-			w.to_string().magenta().to_string()
-		)]));
-	}
+	// Tiling
+	let tiling_label = if info.tile.supported {
+		format!(
+			"{}  {}",
+			"supported".green(),
+			"dynamic spatial dims".dimmed()
+		)
+	} else {
+		let dims = info
+			.tile
+			.fixed_size
+			.map(|(h, w)| format!("{h}×{w}"))
+			.unwrap_or_default();
+		format!(
+			"{}{}",
+			"fixed".yellow(),
+			if dims.is_empty() {
+				String::new()
+			} else {
+				format!("  {dims}")
+			}
+		)
+	};
 
-	if let Some(align) = info.tile.alignment {
-		tiling_children.push(Tree::Leaf(vec![format!(
-			"Alignment: {} pixels",
-			align.to_string().magenta().to_string()
-		)]));
-	}
+	let tiling_children = if let Some(align) = info.tile.alignment {
+		vec![Tree::Leaf(vec![format!(
+			"{}  {}",
+			"Alignment".dimmed(),
+			format!("divisible by {}", align.to_string().bright_white().bold()).dimmed()
+		)])]
+	} else {
+		vec![]
+	};
 
 	children.push(Tree::Node(
-		"Tiling".bright_white().to_string(),
+		format!("{:<11}{}", "Tiling".white(), tiling_label),
 		tiling_children,
 	));
 
+	// Ops (only in verbose mode or always show top-level count)
+	let total_ops: usize = info.op_fingerprint.iter().map(|(_, c)| c).sum();
+	let max_display = if verbose { 20 } else { 8 };
+
+	let mut op_children: Vec<Tree> = info
+		.op_fingerprint
+		.iter()
+		.take(max_display)
+		.map(|(name, count)| {
+			Tree::Leaf(vec![format!(
+				"{:>4}  {}",
+				count.to_string().bright_white().bold(),
+				name.dimmed()
+			)])
+		})
+		.collect();
+
+	let remaining = info.op_fingerprint.len().saturating_sub(max_display);
+	if remaining > 0 {
+		op_children.push(Tree::Leaf(vec![format!(
+			"      {}",
+			format!("… {remaining} more op types").dimmed()
+		)]));
+	}
+
 	children.push(Tree::Node(
-		"ONNX Metadata".bright_white().to_string(),
-		vec![Tree::Leaf(vec![format!(
-			"Opset: {}",
-			info.opset.to_string().blue().to_string()
-		)])],
+		format!(
+			"{:<11}{}  {}",
+			"Ops".white(),
+			total_ops.to_string().bright_white().bold(),
+			"total nodes".dimmed()
+		),
+		op_children,
 	));
 
-	let tree = Tree::Node(filename.to_string(), children);
-	println!("{}", render_to_string(&tree));
+	// Render tree — treelog handles the tree characters (├─, ╰─, │, etc.)
+	let tree = Tree::Node(String::new(), children);
+	let rendered = render_to_string(&tree);
+
+	// Print each line with leading space for proper indentation
+	for line in rendered.lines() {
+		if !line.trim().is_empty() {
+			eprintln!("{line}");
+		}
+	}
+	eprintln!();
 }
 
 fn format_dtype(dtype: &str) -> colored::ColoredString {
 	match dtype {
 		"float32" => dtype.green(),
-		"float16" => dtype.bright_green(),
+		"float16" => dtype.cyan(),
 		"int8" | "uint8" => dtype.blue(),
 		"int32" | "int64" => dtype.bright_blue(),
 		_ => dtype.white(),
