@@ -7,9 +7,9 @@ use crate::inspect::ModelInfo;
 /// This is a conservative estimate that aims to use ~80-85% of available memory
 /// to leave room for system operations and avoid OOM errors.
 pub fn estimate_tile_size(model_info: &ModelInfo, _provider: &crate::upscale::Provider) -> u32 {
-	// For now, use conservative fixed size
-	// TODO: Query actual VRAM/RAM based on provider
-	let default_tile_size = 512u32;
+	// Conservative default for 6GB+ VRAM GPUs
+	// TODO: Query actual VRAM/RAM based on provider and scale dynamically
+	let default_tile_size = 1024u32;
 
 	// Apply model alignment if needed
 	if let Some(align) = model_info.tile.alignment {

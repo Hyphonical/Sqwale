@@ -3,6 +3,7 @@
 use anyhow::{Context, Result};
 use colored::Colorize;
 use image::{DynamicImage, GenericImageView};
+use indicatif::{ProgressBar, ProgressStyle};
 use ndarray::{s, Array2, Array4, ArrayView4, ArrayViewD};
 use ort::session::builder::{AutoDevicePolicy, SessionBuilder};
 use ort::session::Session;
@@ -118,20 +119,30 @@ impl UpscaleSession {
 		// Allocate output and weight canvases
 		let output_width = width * scale;
 		let output_height = height * scale;
+
+		// Setup progress bar
+		let pb = ProgressBar::new(tiles.len() as u64);
+		pb.set_style(
+			ProgressStyle::default_bar()
+				.template(&format!(
+					"  {} {{bar:40.cyan/blue}} {{pos}}/{{len}} tiles | {{msg}}",
+					"→".bright_blue()
+				))
+				.unwrap()
+				.progress_chars("━━╸"),
+		);
+		pb.set_message(format!(
+			"{}×{} → {}×{}",
+			width, height, output_width, output_height
+		));
 		let mut output_canvas =
 			Array4::<f32>::zeros((1, 3, output_height as usize, output_width as usize));
 		let mut weight_canvas =
 			Array2::<f32>::zeros((output_height as usize, output_width as usize));
 
 		// Process each tile
+		let start_time = std::time::Instant::now();
 		for (tile_idx, tile) in tiles.iter().enumerate() {
-			eprintln!(
-				"  {} Processing tile {}/{}",
-				"→".bright_blue(),
-				tile_idx + 1,
-				tiles.len()
-			);
-
 			// Extract tile from input image
 			let tile_img = image.crop_imm(
 				tile.src_rect.0,
@@ -194,7 +205,41 @@ impl UpscaleSession {
 					}
 				}
 			}
+
+			pb.inc(1);
+
+			// Update ETA after each tile
+			let elapsed = start_time.elapsed().as_secs_f32();
+			let tiles_done = tile_idx + 1;
+			let avg_time = elapsed / tiles_done as f32;
+			let remaining_tiles = tiles.len() - tiles_done;
+			let eta_secs = remaining_tiles as f32 * avg_time;
+
+			if remaining_tiles > 0 {
+				let eta_str = if eta_secs < 60.0 {
+					format!("{:.0}s", eta_secs)
+				} else {
+					format!("{:.0}m {:.0}s", eta_secs / 60.0, eta_secs % 60.0)
+				};
+				pb.set_message(format!(
+					"{}×{} → {}×{} | ETA: {} | {:.1}s/tile",
+					width, height, output_width, output_height, eta_str, avg_time
+				));
+			}
 		}
+
+		let total_time = start_time.elapsed().as_secs_f32();
+		let time_str = if total_time < 60.0 {
+			format!("{:.1}s", total_time)
+		} else {
+			format!("{:.0}m {:.0}s", total_time / 60.0, total_time % 60.0)
+		};
+		pb.finish_with_message(format!(
+			"✓ {} tiles completed in {} ({:.1}s/tile)",
+			tiles.len(),
+			time_str,
+			total_time / tiles.len() as f32
+		));
 
 		// Normalize by weights
 		for c in 0..3 {

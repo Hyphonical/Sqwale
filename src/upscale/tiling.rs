@@ -17,7 +17,7 @@ pub struct TileConfig {
 impl Default for TileConfig {
 	fn default() -> Self {
 		Self {
-			tile_size: 512,
+			tile_size: 1024,
 			overlap: 16,
 		}
 	}
