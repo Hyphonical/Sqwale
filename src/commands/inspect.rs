@@ -52,7 +52,7 @@ pub fn run(pattern: &str, _verbose: bool, quiet: bool) -> Result<()> {
 		}
 	}
 
-	if error_count > 0 && !quiet {
+	if !quiet && (success_count > 0 || error_count > 0) {
 		eprintln!();
 		eprintln!(
 			"{} {} {} model(s) inspected, {} {} failed",

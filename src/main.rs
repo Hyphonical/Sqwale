@@ -12,5 +12,11 @@ fn main() -> Result<()> {
 
 	match &cli.command {
 		Commands::Inspect { pattern } => commands::inspect::run(pattern, cli.verbose, cli.quiet),
+		Commands::Upscale {
+			input,
+			model,
+			output,
+			provider,
+		} => commands::upscale::run(input, model, output.as_deref(), provider, cli.quiet),
 	}
 }
