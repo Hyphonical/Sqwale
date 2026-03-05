@@ -1,0 +1,51 @@
+[package]
+name         = "sqwale"
+version      = "0.1.0"
+edition      = "2021"
+rust-version = "1.82.0"
+authors      = ["Hyphonical"]
+license      = "MIT"
+repository   = "https://github.com/Hyphonical/Sqwale"
+
+[[bin]]
+name = "sqwale"
+path = "src/main.rs"
+
+[lib]
+name = "sqwale"
+path = "src/lib.rs"
+
+[dependencies]
+# Model Loading & Inference
+ort     = "2.0.0-rc.11"
+ndarray = "0.17"
+
+# Image Processing
+image = { version = "0.25", default-features = false, features = ["png", "jpeg", "webp"] }
+
+# CLI & Output
+clap    = { version = "4", features = ["derive"] }
+treelog = { version = "0.0.6", features = ["color"] }
+colored = "3"
+
+# Utilities
+anyhow    = "1"
+glob      = "0.3"
+num_cpus = "1"
+
+[profile.release]
+opt-level     = "z"
+lto           = "fat"
+codegen-units = 1
+strip         = true
+panic         = "abort"
+
+[profile.fast]
+inherits      = "release"
+opt-level     = 1
+debug         = 0
+codegen-units = 32
+incremental   = true
+lto           = "off"
+panic         = "abort"
+strip         = false

@@ -1,0 +1,5 @@
+# `rustup component add rustfmt` to install rustfmt if you don't have it already.
+
+hard_tabs = true
+
+tab_spaces = 4
