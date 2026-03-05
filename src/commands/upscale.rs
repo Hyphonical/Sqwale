@@ -10,6 +10,10 @@
 //! Progress bars (via `tracing-indicatif`):
 //! - Tile bar   (child span)  — top
 //! - Batch bar  (parent span) — bottom
+//!
+//! All output emitted while a progress bar is visible uses [`tracing::info!`]
+//! so that `tracing-indicatif` can coordinate redraws and prevent garbled
+//! terminal output.
 
 use anyhow::{Context, Result};
 use colored::Colorize;
@@ -133,6 +137,7 @@ fn run_single(
 	let mut session = UpscaleSession::new(model_path, &options)?;
 	let info = session.model_info().clone();
 
+	// All output before the progress bar — safe to use eprintln.
 	if !quiet {
 		eprintln!(
 			"{}",
@@ -181,7 +186,7 @@ fn run_single(
 
 	let start = std::time::Instant::now();
 
-	// Create a tracing span for the tile progress bar
+	// Tile progress bar via tracing-indicatif span.
 	let tile_span = info_span!("tiles");
 	tile_span.pb_set_style(&tile_bar_style());
 	let _tile_guard = tile_span.enter();
@@ -193,11 +198,13 @@ fn run_single(
 		tile_span.pb_set_position(done as u64);
 	})?;
 
+	// Drop the guard to remove the progress bar before printing results.
 	drop(_tile_guard);
 
 	let elapsed = start.elapsed().as_secs_f64();
 	let (ow, oh) = upscaled.dimensions();
 
+	// All output after the progress bar — safe to use eprintln.
 	if !quiet {
 		eprintln!(
 			"{}",
@@ -283,6 +290,7 @@ fn run_batch(
 
 	let total = matches.len();
 
+	// Header — printed before any progress bar is active.
 	if !quiet {
 		eprintln!("{}", format!("── upscale · batch ──{:─<36}", "").dimmed());
 		eprintln!();
@@ -311,7 +319,7 @@ fn run_batch(
 		eprintln!();
 	}
 
-	// Parent span → batch progress bar (bottom)
+	// Parent span → batch progress bar (bottom).
 	let batch_span = info_span!("batch");
 	batch_span.pb_set_style(&batch_bar_style());
 	batch_span.pb_set_length(total as u64);
@@ -325,9 +333,9 @@ fn run_batch(
 		if interrupted.load(Ordering::SeqCst) {
 			skipped = total - idx;
 			if !quiet {
-				eprintln!();
-				eprintln!(
-					"{} {}",
+				// tracing::info! because the batch bar is still active.
+				tracing::info!(
+					"\n{} {}",
 					"⚠".yellow().bold(),
 					"Interrupted — finishing current image, skipping remaining".white()
 				);
@@ -338,7 +346,8 @@ fn run_batch(
 		let img_start = std::time::Instant::now();
 
 		if !quiet {
-			eprintln!(
+			// tracing::info! while batch bar is visible.
+			tracing::info!(
 				"{} {} {}",
 				"●".cyan().bold(),
 				format!("[{}/{}]", idx + 1, total).dimmed(),
@@ -351,7 +360,7 @@ fn run_batch(
 			Err(e) => {
 				let msg = format!("{e:#}");
 				if !quiet {
-					eprintln!(
+					tracing::info!(
 						"  {} {}",
 						"✗".red(),
 						format!("Failed to decode image: {msg}").white()
@@ -365,7 +374,7 @@ fn run_batch(
 
 		let (w, h) = input_image.dimensions();
 		if !quiet {
-			eprintln!(
+			tracing::info!(
 				"{}",
 				format!(
 					"  · Input   {}×{}",
@@ -376,7 +385,7 @@ fn run_batch(
 			);
 		}
 
-		// Child span → tile progress bar (top)
+		// Child span → tile progress bar (top).
 		let tile_span = info_span!("tiles");
 		tile_span.pb_set_style(&tile_bar_style());
 		let tile_span_entered = tile_span.enter();
@@ -394,7 +403,7 @@ fn run_batch(
 			Ok(upscaled) => {
 				let (ow, oh) = upscaled.dimensions();
 				if !quiet {
-					eprintln!(
+					tracing::info!(
 						"{}",
 						format!(
 							"  · Output  {}×{}",
@@ -420,19 +429,18 @@ fn run_batch(
 						let elapsed = img_start.elapsed().as_secs_f64();
 						ok += 1;
 						if !quiet {
-							eprintln!(
+							tracing::info!(
 								"  {} {}  {}",
 								"✓".green(),
 								out_path.display().to_string().bright_white(),
 								fmt_duration(elapsed).dimmed()
 							);
-							eprintln!();
 						}
 					}
 					Err(e) => {
 						let msg = format!("Failed to save: {e:#}");
 						if !quiet {
-							eprintln!("  {} {}", "✗".red(), msg.white());
+							tracing::info!("  {} {}", "✗".red(), msg.white());
 						}
 						failed.push((input_path.clone(), msg));
 					}
@@ -441,7 +449,7 @@ fn run_batch(
 			Err(e) => {
 				let msg = format!("{e:#}");
 				if !quiet {
-					eprintln!(
+					tracing::info!(
 						"  {} {}",
 						"✗".red(),
 						format!("Upscale failed: {msg}").white()
@@ -454,9 +462,10 @@ fn run_batch(
 		batch_span.pb_inc(1);
 	}
 
+	// Drop the batch guard to remove the progress bar before printing summary.
 	drop(_batch_guard);
 
-	// ── Summary ────────────────────────────────────────────────────────────
+	// ── Summary (no progress bars active) ──────────────────────────────────
 
 	if !quiet {
 		if interrupted.load(Ordering::SeqCst) {
@@ -489,7 +498,6 @@ fn run_batch(
 		}
 		eprintln!();
 
-		// List failures
 		for (path, msg) in &failed {
 			eprintln!("  {} {}  {}", "✗".dimmed(), path.display(), msg.dimmed());
 		}
