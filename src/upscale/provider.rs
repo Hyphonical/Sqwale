@@ -1,7 +1,6 @@
 //! Execution provider management with platform-specific fallback support.
 
 use anyhow::Result;
-use colored::Colorize;
 use ort::ep::ExecutionProviderDispatch;
 use std::str::FromStr;
 
@@ -19,10 +18,10 @@ pub enum Provider {
 
 impl Provider {
 	/// Build execution provider dispatch with automatic CPU fallback.
-	/// Returns (dispatch, actual_provider, warning_message).
+	///
+	/// Returns `(dispatches, actual_provider, optional_warning)`.
 	pub fn build(self) -> (Vec<ExecutionProviderDispatch>, Self, Option<String>) {
 		match self {
-			// Auto variant returns empty dispatch to signal auto_device usage
 			Self::Auto => (vec![], Self::Auto, None),
 
 			Self::Cpu => (vec![ort::ep::CPU::default().build()], Self::Cpu, None),
@@ -30,8 +29,7 @@ impl Provider {
 			Self::Cuda => {
 				#[cfg(any(target_os = "windows", target_os = "linux"))]
 				{
-					let cuda_available = self.check_availability();
-					if cuda_available {
+					if self.check_availability() {
 						(
 							vec![
 								ort::ep::CUDA::default().build(),
@@ -44,11 +42,7 @@ impl Provider {
 						(
 							vec![ort::ep::CPU::default().build()],
 							Self::Cpu,
-							Some(format!(
-								"{} CUDA unavailable, using CPU instead\n  {} Ensure NVIDIA GPU drivers and CUDA runtime are installed",
-								"⚠".yellow(),
-								"Hint:".yellow()
-							)),
+							Some("⚠ CUDA unavailable — falling back to CPU. Ensure NVIDIA drivers and CUDA runtime are installed.".into()),
 						)
 					}
 				}
@@ -57,10 +51,7 @@ impl Provider {
 					(
 						vec![ort::ep::CPU::default().build()],
 						Self::Cpu,
-						Some(format!(
-							"{} CUDA not supported on this platform, using CPU",
-							"⚠".yellow()
-						)),
+						Some("⚠ CUDA is not supported on this platform — using CPU.".into()),
 					)
 				}
 			}
@@ -68,8 +59,7 @@ impl Provider {
 			Self::TensorRT => {
 				#[cfg(any(target_os = "windows", target_os = "linux"))]
 				{
-					let trt_available = self.check_availability();
-					if trt_available {
+					if self.check_availability() {
 						(
 							vec![
 								ort::ep::TensorRT::default().build(),
@@ -82,11 +72,7 @@ impl Provider {
 						(
 							vec![ort::ep::CPU::default().build()],
 							Self::Cpu,
-							Some(format!(
-								"{} TensorRT unavailable, using CPU instead\n  {} Install TensorRT and ensure CUDA is available",
-								"⚠".yellow(),
-								"Hint:".yellow()
-							)),
+							Some("⚠ TensorRT unavailable — falling back to CPU. Install TensorRT and ensure CUDA is available.".into()),
 						)
 					}
 				}
@@ -95,10 +81,7 @@ impl Provider {
 					(
 						vec![ort::ep::CPU::default().build()],
 						Self::Cpu,
-						Some(format!(
-							"{} TensorRT not supported on this platform, using CPU",
-							"⚠".yellow()
-						)),
+						Some("⚠ TensorRT is not supported on this platform — using CPU.".into()),
 					)
 				}
 			}
@@ -120,10 +103,7 @@ impl Provider {
 					(
 						vec![ort::ep::CPU::default().build()],
 						Self::Cpu,
-						Some(format!(
-							"{} CoreML only available on macOS, using CPU",
-							"⚠".yellow()
-						)),
+						Some("⚠ CoreML is only available on macOS — using CPU.".into()),
 					)
 				}
 			}
@@ -145,23 +125,18 @@ impl Provider {
 					(
 						vec![ort::ep::CPU::default().build()],
 						Self::Cpu,
-						Some(format!(
-							"{} XNNPACK only available on Linux, using CPU",
-							"⚠".yellow()
-						)),
+						Some("⚠ XNNPACK is only available on Linux — using CPU.".into()),
 					)
 				}
 			}
 		}
 	}
 
-	/// Check if provider is available at runtime (basic heuristic).
+	/// Heuristic availability check.
 	fn check_availability(self) -> bool {
 		match self {
-			Self::Auto => true,
-			Self::Cpu => true,
+			Self::Auto | Self::Cpu => true,
 			Self::Cuda | Self::TensorRT => {
-				// Basic check: CUDA requires nvidia-smi to be present
 				std::process::Command::new("nvidia-smi").output().is_ok()
 			}
 			Self::CoreML => cfg!(target_os = "macos"),
@@ -169,7 +144,7 @@ impl Provider {
 		}
 	}
 
-	/// Get display name for provider.
+	/// Display name.
 	pub fn name(self) -> &'static str {
 		match self {
 			Self::Auto => "Auto",
@@ -184,7 +159,7 @@ impl Provider {
 
 impl std::fmt::Display for Provider {
 	fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-		write!(f, "{}", self.name())
+		f.write_str(self.name())
 	}
 }
 
@@ -199,11 +174,8 @@ impl FromStr for Provider {
 			"tensorrt" | "trt" => Ok(Self::TensorRT),
 			"coreml" => Ok(Self::CoreML),
 			"xnnpack" => Ok(Self::XNNPack),
-			_ => anyhow::bail!(
-				"{} '{}'\n  {} Valid providers: auto, cpu, cuda, tensorrt, coreml, xnnpack",
-				"Unknown provider:".red().bold(),
-				s.bright_white(),
-				"Hint:".yellow()
+			other => anyhow::bail!(
+				"Unknown provider '{other}'. Valid options: auto, cpu, cuda, tensorrt, coreml, xnnpack"
 			),
 		}
 	}

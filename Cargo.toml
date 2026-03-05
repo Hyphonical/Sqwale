@@ -25,16 +25,20 @@ half    = "2"
 image = { version = "0.25", default-features = false, features = ["png", "jpeg", "webp"] }
 
 # CLI & Output
-clap    = { version = "4", features = ["derive"] }
-treelog = { version = "0.0.6", features = ["color"] }
-colored = "3"
-indicatif = "0.17"
-ctrlc = "3"
+clap      = { version = "4", features = ["derive"] }
+treelog   = { version = "0.0.6", features = ["color"] }
+colored   = "3"
+indicatif = "0.18"
+ctrlc     = "3"
+
+# Logging & Progress
+tracing            = "0.1"
+tracing-subscriber = { version = "0.3", features = ["fmt", "registry"] }
+tracing-indicatif  = "0.3"
 
 # Utilities
-anyhow    = "1"
-glob      = "0.3"
-num_cpus = "1"
+anyhow = "1"
+glob   = "0.3"
 
 [profile.release]
 opt-level     = "z"

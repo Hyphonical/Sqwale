@@ -8,7 +8,8 @@
 //!
 //! ## Inspecting Models
 //!
-//! Use [`inspect_model`] to extract metadata from an ONNX model without creating an inference session:
+//! Use [`inspect_model`] to extract metadata from an ONNX model without
+//! creating an inference session:
 //!
 //! ```no_run
 //! use sqwale::inspect_model;
@@ -22,7 +23,8 @@
 //!
 //! ## Upscaling Images
 //!
-//! Create an [`UpscaleSession`] to upscale images. The session can be reused for multiple images:
+//! Create an [`UpscaleSession`] to upscale images. The session can be reused
+//! for multiple images:
 //!
 //! ```no_run
 //! use sqwale::{UpscaleSession, UpscaleOptions, Provider};
@@ -34,42 +36,25 @@
 //! };
 //!
 //! let session = UpscaleSession::new(Path::new("model.onnx"), &options)?;
-//! let input_image = open("input.png")?;
-//! let upscaled = session.upscale(input_image)?;
-//! upscaled.save("output.png")?;
+//! // `upscale` now takes a progress callback: (tiles_done, total_tiles)
+//! // let upscaled = session.upscale(image, |done, total| { /* progress */ })?;
 //! # Ok::<(), Box<dyn std::error::Error>>(())
 //! ```
 //!
 //! ## GPU Acceleration
 //!
-//! Specify a GPU provider for hardware acceleration. The library automatically falls back to CPU if the provider is unavailable:
+//! Specify a GPU provider for hardware acceleration. The library automatically
+//! falls back to CPU if the provider is unavailable:
 //!
 //! ```no_run
 //! use sqwale::{UpscaleSession, UpscaleOptions, Provider};
 //! use std::path::Path;
 //!
 //! let options = UpscaleOptions {
-//!     provider: Provider::Cuda, // Falls back to CPU if CUDA unavailable
+//!     provider: Provider::Cuda,
 //! };
 //!
 //! let session = UpscaleSession::new(Path::new("model.onnx"), &options)?;
-//! # Ok::<(), Box<dyn std::error::Error>>(())
-//! ```
-//!
-//! ## FP16 Models
-//!
-//! The library automatically handles fp16 models by converting between fp32 and fp16 as needed:
-//!
-//! ```no_run
-//! use sqwale::{inspect_model, UpscaleSession, UpscaleOptions, Provider};
-//! use std::path::Path;
-//!
-//! let info = inspect_model(Path::new("model_fp16.onnx"))?;
-//! assert_eq!(info.input_dtype, "float16");
-//!
-//! // Session automatically handles fp32 ↔ fp16 conversion
-//! let options = UpscaleOptions { provider: Provider::Cpu };
-//! let session = UpscaleSession::new(Path::new("model_fp16.onnx"), &options)?;
 //! # Ok::<(), Box<dyn std::error::Error>>(())
 //! ```
 

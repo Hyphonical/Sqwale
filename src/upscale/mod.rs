@@ -2,8 +2,8 @@
 
 mod provider;
 mod session;
+pub mod tile_size;
 mod tiling;
-mod vram;
 
 pub use provider::Provider;
 pub use session::{UpscaleOptions, UpscaleSession};
