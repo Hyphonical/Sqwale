@@ -47,7 +47,11 @@ pub fn run(
 		);
 	}
 
-	let options = UpscaleOptions { provider };
+	let options = UpscaleOptions {
+		provider,
+		tile_size: None, // Auto-calculate
+		overlap: 16,     // Default overlap
+	};
 	let mut session = UpscaleSession::new(model_path, &options)?;
 
 	if !quiet {

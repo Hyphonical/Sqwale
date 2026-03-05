@@ -2,8 +2,8 @@
 
 use anyhow::{Context, Result};
 use colored::Colorize;
-use image::DynamicImage;
-use ndarray::{Array4, ArrayView4, ArrayViewD};
+use image::{DynamicImage, GenericImageView};
+use ndarray::{s, Array2, Array4, ArrayView4, ArrayViewD};
 use ort::session::builder::{AutoDevicePolicy, SessionBuilder};
 use ort::session::Session;
 use ort::value::Value;
@@ -12,16 +12,22 @@ use std::path::Path;
 use crate::inspect::{inspect_model, ModelInfo};
 
 use super::provider::Provider;
+use super::tiling::{compute_tile_grid, generate_blend_weights, TileConfig};
+use super::vram::estimate_tile_size;
 
 /// Configuration options for upscaling.
 pub struct UpscaleOptions {
 	pub provider: Provider,
+	pub tile_size: Option<u32>,
+	pub overlap: u32,
 }
 
 impl Default for UpscaleOptions {
 	fn default() -> Self {
 		Self {
 			provider: Provider::Auto,
+			tile_size: None,
+			overlap: 16,
 		}
 	}
 }
@@ -31,6 +37,7 @@ pub struct UpscaleSession {
 	session: Session,
 	model_info: ModelInfo,
 	actual_provider: Provider,
+	tile_config: TileConfig,
 }
 
 impl UpscaleSession {
@@ -72,10 +79,21 @@ impl UpscaleSession {
 			);
 		}
 
+		// Determine tile configuration
+		let tile_size = options
+			.tile_size
+			.unwrap_or_else(|| estimate_tile_size(&model_info, &actual_provider));
+
+		let tile_config = TileConfig {
+			tile_size,
+			overlap: options.overlap,
+		};
+
 		Ok(Self {
 			session,
 			model_info,
 			actual_provider,
+			tile_config,
 		})
 	}
 
@@ -89,11 +107,112 @@ impl UpscaleSession {
 		self.actual_provider
 	}
 
-	/// Upscale an image.
+	/// Upscale an image using tiled inference.
 	pub fn upscale(&mut self, image: DynamicImage) -> Result<DynamicImage> {
-		let input_tensor = self.prepare_input(image)?;
+		let (width, height) = image.dimensions();
+		let scale = self.model_info.scale;
 
-		// Check if model expects fp16
+		// Compute tile grid
+		let tiles = compute_tile_grid(width, height, &self.model_info, &self.tile_config)?;
+
+		// Allocate output and weight canvases
+		let output_width = width * scale;
+		let output_height = height * scale;
+		let mut output_canvas =
+			Array4::<f32>::zeros((1, 3, output_height as usize, output_width as usize));
+		let mut weight_canvas =
+			Array2::<f32>::zeros((output_height as usize, output_width as usize));
+
+		// Process each tile
+		for (tile_idx, tile) in tiles.iter().enumerate() {
+			eprintln!(
+				"  {} Processing tile {}/{}",
+				"→".bright_blue(),
+				tile_idx + 1,
+				tiles.len()
+			);
+
+			// Extract tile from input image
+			let tile_img = image.crop_imm(
+				tile.src_rect.0,
+				tile.src_rect.1,
+				tile.src_rect.2,
+				tile.src_rect.3,
+			);
+
+			// Convert to tensor and add padding
+			let mut tile_tensor = self.image_to_tensor(&tile_img)?;
+
+			// Apply padding if needed
+			if tile.padding != (0, 0, 0, 0) {
+				tile_tensor = self.pad_tensor(tile_tensor, tile.padding)?;
+			}
+
+			// Run inference on tile
+			let output_tile = self.infer_tile(tile_tensor)?;
+
+			// Remove padding from output
+			let valid_output = self.crop_tensor(
+				output_tile.view(),
+				tile.padding.0 * scale,
+				tile.padding.1 * scale,
+				tile.padding.2 * scale,
+				tile.padding.3 * scale,
+			)?;
+
+			// Generate blend weights for this tile
+			let tile_out_w = tile.src_rect.2 * scale;
+			let tile_out_h = tile.src_rect.3 * scale;
+			let overlap_scaled = self.tile_config.overlap * scale;
+
+			let weights = if self.model_info.tile.fixed_size.is_some() {
+				// Fixed-size models: no blending (no overlap)
+				Array2::<f32>::ones((tile_out_h as usize, tile_out_w as usize))
+			} else {
+				generate_blend_weights(tile_out_w, tile_out_h, overlap_scaled)?
+			};
+
+			// Accumulate into output canvas
+			let dst_x = tile.dst_rect.0 as usize;
+			let dst_y = tile.dst_rect.1 as usize;
+			let dst_w = tile_out_w as usize;
+			let dst_h = tile_out_h as usize;
+
+			for c in 0..3 {
+				for y in 0..dst_h {
+					for x in 0..dst_w {
+						let canvas_y = dst_y + y;
+						let canvas_x = dst_x + x;
+						if canvas_y < output_height as usize && canvas_x < output_width as usize {
+							let weight = weights[[y, x]];
+							output_canvas[[0, c, canvas_y, canvas_x]] +=
+								valid_output[[0, c, y, x]] * weight;
+							if c == 0 {
+								weight_canvas[[canvas_y, canvas_x]] += weight;
+							}
+						}
+					}
+				}
+			}
+		}
+
+		// Normalize by weights
+		for c in 0..3 {
+			for y in 0..(output_height as usize) {
+				for x in 0..(output_width as usize) {
+					let weight = weight_canvas[[y, x]];
+					if weight > 0.0 {
+						output_canvas[[0, c, y, x]] /= weight;
+					}
+				}
+			}
+		}
+
+		self.tensor_to_image(output_canvas.view())
+	}
+
+	/// Run inference on a single tile tensor.
+	fn infer_tile(&mut self, input_tensor: Array4<f32>) -> Result<Array4<f32>> {
 		let is_fp16 = self.model_info.input_dtype.eq_ignore_ascii_case("float16");
 
 		let outputs = if is_fp16 {
@@ -121,7 +240,7 @@ impl UpscaleSession {
 				.context("Inference failed")?
 		};
 
-		// Extract output (model output dtype matches input dtype)
+		// Extract output
 		let output_tensor = if is_fp16 {
 			let output_view: ArrayViewD<half::f16> = outputs[0]
 				.try_extract_array()
@@ -130,7 +249,7 @@ impl UpscaleSession {
 				.into_dimensionality()
 				.context("Failed to reshape output tensor")?;
 
-			// Convert f16 back to f32 for image processing
+			// Convert f16 back to f32
 			let shape = output_4d.shape();
 			let f32_data: Vec<f32> = output_4d.iter().map(|&v| v.to_f32()).collect();
 			Array4::<f32>::from_shape_vec((shape[0], shape[1], shape[2], shape[3]), f32_data)
@@ -145,13 +264,11 @@ impl UpscaleSession {
 			output_4d.to_owned()
 		};
 
-		drop(outputs);
-
-		self.tensor_to_image(output_tensor.view())
+		Ok(output_tensor)
 	}
 
-	/// Prepare input tensor from image.
-	fn prepare_input(&self, image: DynamicImage) -> Result<Array4<f32>> {
+	/// Convert image to normalized tensor.
+	fn image_to_tensor(&self, image: &DynamicImage) -> Result<Array4<f32>> {
 		let rgb = image.to_rgb8();
 		let (width, height) = rgb.dimensions();
 
@@ -167,6 +284,63 @@ impl UpscaleSession {
 		}
 
 		Ok(tensor)
+	}
+
+	/// Add zero padding to a tensor.
+	fn pad_tensor(
+		&self,
+		tensor: Array4<f32>,
+		padding: (u32, u32, u32, u32),
+	) -> Result<Array4<f32>> {
+		let (pad_left, pad_top, pad_right, pad_bottom) = padding;
+		let shape = tensor.shape();
+		let (batch, channels, height, width) = (shape[0], shape[1], shape[2], shape[3]);
+
+		let new_height = height + pad_top as usize + pad_bottom as usize;
+		let new_width = width + pad_left as usize + pad_right as usize;
+
+		let mut padded = Array4::<f32>::zeros((batch, channels, new_height, new_width));
+
+		// Copy original data into center
+		for b in 0..batch {
+			for c in 0..channels {
+				for y in 0..height {
+					for x in 0..width {
+						padded[[b, c, y + pad_top as usize, x + pad_left as usize]] =
+							tensor[[b, c, y, x]];
+					}
+				}
+			}
+		}
+
+		Ok(padded)
+	}
+
+	/// Crop a tensor by removing padding.
+	fn crop_tensor(
+		&self,
+		tensor: ArrayView4<f32>,
+		pad_left: u32,
+		pad_top: u32,
+		pad_right: u32,
+		pad_bottom: u32,
+	) -> Result<Array4<f32>> {
+		let shape = tensor.shape();
+		let (_batch, _channels, height, width) = (shape[0], shape[1], shape[2], shape[3]);
+
+		let crop_height = height - pad_top as usize - pad_bottom as usize;
+		let crop_width = width - pad_left as usize - pad_right as usize;
+
+		let cropped = tensor
+			.slice(s![
+				..,
+				..,
+				pad_top as usize..pad_top as usize + crop_height,
+				pad_left as usize..pad_left as usize + crop_width
+			])
+			.to_owned();
+
+		Ok(cropped)
 	}
 
 	/// Convert output tensor to image.

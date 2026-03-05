@@ -8,9 +8,10 @@ pub use detect::inspect_model;
 // ── Color Space ────────────────────────────────────────────────────────────
 
 /// The color space inferred from the model's channel count.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub enum ColorSpace {
 	Grayscale,
+	#[default]
 	Rgb,
 	Rgba,
 	Unknown(u32),
@@ -42,12 +43,13 @@ impl ColorSpace {
 // ── Scale Source ───────────────────────────────────────────────────────────
 
 /// How the upscale factor was detected.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub enum ScaleSource {
 	Metadata,
 	StaticShapeRatio,
 	DepthToSpace,
 	ConvTransposeStride,
+	#[default]
 	Assumed,
 }
 
@@ -66,7 +68,7 @@ impl std::fmt::Display for ScaleSource {
 // ── Tile Requirements ──────────────────────────────────────────────────────
 
 /// Tiling constraints extracted from the model graph.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct TileInfo {
 	/// Whether the model supports tiling (dynamic spatial dims).
 	pub supported: bool,
@@ -106,7 +108,7 @@ impl TileInfo {
 // ── Model Metadata ─────────────────────────────────────────────────────────
 
 /// All metadata extracted from an ONNX model without running inference.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct ModelInfo {
 	/// Upscale factor (1 for restoration / denoising models).
 	pub scale: u32,
