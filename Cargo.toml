@@ -28,7 +28,7 @@ image = { version = "0.25", default-features = false, features = ["png", "jpeg",
 clap    = { version = "4", features = ["derive"] }
 treelog = { version = "0.0.6", features = ["color"] }
 colored = "3"
-indicatif = "0.17"
+indicatif = "0.18"
 ctrlc = "3"
 
 # Utilities
