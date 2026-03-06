@@ -1,23 +1,10 @@
 # Sqwale
 
-A fast, cross-platform CLI and Rust library for running ONNX super-resolution models with automatic tiling, GPU acceleration, and beautiful progress visualization.
-
-## Features
-
-- 🚀 **High Performance**: GPU-accelerated inference with CUDA, TensorRT, CoreML, and CPU fallback
-- 🔍 **Model Inspection**: Analyze ONNX models without running inference—detect scale, color space, precision, tiling support, and more
-- 🎯 **Smart Tiling**: Automatic tile-based processing with seamless blending for large images
-- 🎨 **Beautiful Output**: Colored, styled terminal output with progress bars and real-time statistics
-- 🔧 **Flexible**: Single-image and batch processing with glob pattern support
-- 📦 **Broad Format Support**: PNG, JPEG, WebP, GIF, TIFF, BMP, and more via the `image` crate
-- 🔬 **Float16 Ready**: Automatic detection and handling of FP16 models
-- ⚡ **Cross-Platform**: Windows, Linux, and macOS support
+A fast, cross-platform CLI for upscaling images with ONNX super-resolution models. Automatic tiling, GPU acceleration, and clean terminal output.
 
 ## Installation
 
-### From Source
-
-Requires Rust 1.82 or later:
+Requires Rust 1.85 or later:
 
 ```bash
 git clone https://github.com/Hyphonical/Sqwale.git
@@ -27,13 +14,7 @@ cargo build --release
 
 The binary will be at `target/release/sqwale` (or `sqwale.exe` on Windows).
 
-### System Requirements
-
-- **Windows**: CUDA/TensorRT support (optional)
-- **Linux**: CUDA/TensorRT/XNNPACK support (optional)
-- **macOS**: CoreML support (optional)
-
-GPU acceleration requires appropriate drivers and runtimes installed. Sqwale will automatically fall back to CPU if GPU providers are unavailable.
+GPU acceleration requires appropriate drivers and runtimes. Sqwale automatically falls back to CPU if GPU providers are unavailable.
 
 ## Usage
 
@@ -43,16 +24,14 @@ Analyze ONNX model properties without running inference:
 
 ```bash
 # Single model
-sqwale inspect models/4x-UltraSharp.onnx
+sqwale inspect model.onnx
 
 # Multiple models with glob
 sqwale inspect "models/*.onnx"
 
-# Entire directory (recursive)
+# Entire directory
 sqwale inspect models/
 ```
-
-**Output Example:**
 
 ```
 ● 2x-AnimeSharpV2_MoSR_Sharp_fp16.onnx
@@ -76,208 +55,108 @@ sqwale inspect models/
 
 ### Upscale Images
 
-Process single images or batches with automatic tiling and GPU acceleration:
-
 ```bash
-# Single image (auto output path: input_2x.png)
-sqwale upscale input.png -m models/2x-model.onnx
+# Single image (output: input_2x.png)
+sqwale upscale input.png -m model.onnx
 
-# Single image with specific output
-sqwale upscale input.png -m models/2x-model.onnx -o output.png
+# Explicit output path
+sqwale upscale input.png -m model.onnx -o output.png
 
 # Batch processing
-sqwale upscale "images/*.png" -m models/4x-model.onnx -o upscaled/
+sqwale upscale "photos/*.jpg" -m model.onnx -o upscaled/
 
-# Custom tile size and overlap
-sqwale upscale input.png -m models/2x-model.onnx --tile-size 768 --tile-overlap 32
+# Custom tiling
+sqwale upscale input.png -m model.onnx --tile-size 768 --tile-overlap 32
 ```
 
-**Output Example:**
+```
+● input.jpg
+·  Model 2x · RGB · float32 · dynamic  model.onnx via auto
+·  Input 4000×6000
+  ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━  117/117 tiles  27s  0.2s/tile
+·  Output 8000×12000
+✓ input_2x.jpg  27s
+```
+
+Batch mode shows dual progress bars — per-image tile progress on top, overall batch progress with ETA on the bottom:
 
 ```
-● input.png
-  ·  Model   2x · RGB · float16 · dynamic  MoSR_Sharp_fp16.onnx via CUDA
-  ·  Input   5776×3856
-  ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━  24/24 tiles  2m 34s  3.9s/tile
-  ·  Output  11552×7712
-✓ output_2x.png  2m 34s
+● [1/5] photos/img1.jpg
+  · Input 5776×3856
+  ━━━━━━━━━━━━━━━━━━━━╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌  12/24 tiles  1m 02s  3.9s/tile
+  ━━━━━━━━╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌   1/5  images  1m 02s  ~4m 08s remaining
 ```
 
 ### Options
 
-#### Global Options
-
-- `--provider <auto|cpu|cuda|tensorrt|coreml|xnnpack>` — Execution provider (default: `auto`)
-- `--tile-size <pixels>` — Tile size for large images (default: `512`, `0` = disable tiling)
-- `--tile-overlap <pixels>` — Overlap between tiles for seamless blending (default: `16`)
-
-#### Command-Specific Options
-
-**`inspect`**
-- `<PATTERN>` — File path, glob pattern, or directory
-
-**`upscale`**
-- `<INPUT>` — Input image path or glob pattern
-- `-m, --model <MODEL>` — ONNX model path
-- `-o, --output <OUTPUT>` — Output path or directory (optional)
+| Option | Description | Default |
+|---|---|---|
+| `--provider <name>` | Execution provider: `auto`, `cpu`, `cuda`, `tensorrt`, `directml`, `coreml`, `xnnpack` | `auto` |
+| `--tile-size <px>` | Tile size in pixels (`0` = no tiling) | `512` |
+| `--tile-overlap <px>` | Overlap between adjacent tiles | `16` |
 
 ### Provider Selection
 
-Sqwale automatically selects the best available execution provider:
+Sqwale picks the best available provider automatically:
 
-- **Windows**: TensorRT → CUDA → CPU
-- **Linux**: TensorRT → CUDA → XNNPACK → CPU
-- **macOS**: CoreML → CPU
+| Platform | Priority |
+|---|---|
+| Windows | TensorRT → CUDA → DirectML → CPU |
+| Linux | TensorRT → CUDA → XNNPACK → CPU |
+| macOS | CoreML → CPU |
 
-Override with `--provider`:
+Override with `--provider cuda`. Falls back to CPU on failure.
 
-```bash
-sqwale upscale input.png -m model.onnx --provider cuda
-```
+### Tiling
 
-If the specified provider fails, Sqwale falls back to CPU with a warning.
+Large images are split into overlapping tiles, each processed independently and blended together with cosine-weighted (Hann) windows for seamless output.
 
-### Tiling Strategy
+- **Dynamic models** use `--tile-size` (default 512px), respecting model alignment requirements.
+- **Fixed-size models** automatically use the model's required tile dimensions.
+- **Disable tiling** with `--tile-size 0` to process the entire image at once.
 
-Sqwale automatically tiles large images to fit within GPU memory constraints:
+### Ctrl+C Handling
 
-- **Dynamic spatial models** (variable input size):
-  - Use configured `--tile-size` (default 512px)
-  - Respect model alignment requirements (e.g., divisible by 16)
-  - Seamless blending with cosine-weighted overlap
-
-- **Fixed spatial models** (static input size):
-  - Automatically use model's required tile size
-  - Sliding window with padding and cropping
-
-- **Disable tiling**: `--tile-size 0` (processes entire image at once)
-
-### Batch Processing
-
-Process multiple images efficiently:
-
-```bash
-sqwale upscale "photos/*.jpg" -m models/4x-model.onnx -o upscaled/
-```
-
-**Features:**
-- Progress bars for both per-image tiles and overall batch progress
-- Continues on individual file failures
-- Ctrl+C handling: first press finishes current image and skips remaining, second press force-exits
-
-### Environment Variables
-
-- `NO_COLOR` — Disable colored output
-- `CI` — Disable colors and progress bars (auto-detected in CI environments)
-- `RUST_LOG` — Control log verbosity (e.g., `RUST_LOG=sqwale=debug`)
-- `ORT_LOG_SEVERITY_LEVEL` — ONNX Runtime log level (overridden by Sqwale to `3` = Error)
+- First press: finishes the current image and skips the rest of the batch.
+- Second press: exits immediately.
 
 ## Supported Formats
 
-Input and output formats via the `image` crate:
+PNG, JPEG, WebP, GIF, TIFF, BMP, ICO, PNM, QOI, HDR — via the [image](https://github.com/image-rs/image) crate.
 
-- PNG, JPEG, WebP
-- GIF, TIFF, BMP
-- ICO, PNM, QOI, HDR
+Output format always matches input format.
 
-**Note:** Output format must match input format (no conversion). Use a separate tool like ImageMagick for format conversion.
+## Model Compatibility
 
-## Model Requirements
+Sqwale works with ONNX super-resolution models using:
 
-Sqwale supports ONNX models with:
+- NCHW layout, RGB (3-channel) input/output
+- float32 or float16 precision
+- `[0, 1]` normalization range
 
-- **Input**: NCHW layout, RGB color space (3 channels), float32 or float16 dtype
-- **Output**: Same layout and channels as input
-- **Color normalization**: `[0, 1]` range (default)
-- **Common architectures**: ESRGAN, Real-ESRGAN, SwinIR, HAT, Compact models, and more
+Scale factor, tiling support, and data types are detected automatically from the ONNX graph.
 
-Model detection is automatic—Sqwale infers scale factor, tiling support, and data types from the ONNX graph.
+**Where to find models:** [OpenModelDB](https://openmodeldb.info) · [upscale.wiki](https://upscale.wiki)
 
-### Where to Find Models
+## Environment Variables
 
-- [OpenModelDB](https://openmodeldb.info) — Comprehensive database of upscaling models
-- [upscale.wiki](https://upscale.wiki) — Community wiki with model links and guides
+| Variable | Effect |
+|---|---|
+| `NO_COLOR` | Disable colored output |
+| `CI` | Disable colors and progress bars |
+| `RUST_LOG` | Log verbosity (e.g. `sqwale=debug`) |
 
-## Library Usage
+## Roadmap
 
-Sqwale can be used as a Rust library:
+Potential future directions:
 
-```toml
-[dependencies]
-sqwale = "0.1"
-```
+- **Video frame upscaling** — extract frames, upscale individually, reassemble. Batch processing already handles the core loop; integration with FFmpeg for decode/encode is the main work.
+- **Frame interpolation** — generate intermediate frames for smooth slow-motion or framerate conversion. A different class of models but a natural companion to spatial upscaling.
+- **Parallel image processing** — process multiple images concurrently using separate sessions, improving throughput on multi-GPU systems or when tiles leave GPU headroom.
 
-```rust
-use sqwale::{inspect_model, load_model, upscale_image, ProviderSelection, UpscaleOptions};
-use std::path::Path;
-use std::sync::{atomic::AtomicBool, Arc};
+## License
 
-fn main() -> anyhow::Result<()> {
-    // Inspect a model
-    let info = inspect_model(Path::new("model.onnx"))?;
-    println!("Scale: {}x, Precision: {}", info.scale, info.input_dtype);
-
-    // Load model and create session
-    let mut ctx = load_model(Path::new("model.onnx"), ProviderSelection::Auto)?;
-
-    // Load image
-    let img = image::open("input.png")?;
-
-    // Upscale with options
-    let opts = UpscaleOptions {
-        tile_size: 512,
-        tile_overlap: 16,
-        cancel: Arc::new(AtomicBool::new(false)),
-        on_tile_done: None,
-    };
-
-    let upscaled = upscale_image(&mut ctx, &ctx.model_info.clone(), &img, &opts)?;
-
-    // Save result
-    upscaled.save("output_2x.png")?;
-
-    Ok(())
-}
-```
-
-## Development
-
-### Build Profiles
-
-- `dev` — Debug build with full symbols
-- `fast` — Quick optimized build for testing (`cargo build --profile fast`)
-- `release` — Fully optimized production build (`cargo build --release`)
-
-### Code Quality
-
-Run checks before committing:
-
-```bash
-cargo fmt              # Format code
-cargo clippy           # Lint warnings
-cargo test             # Run tests (when added)
-cargo check            # Verify compilation
-```
-
-## Architecture
-
-- **`src/lib.rs`** — Public library API
-- **`src/main.rs`** — CLI entry point and argument parsing
-- **`src/inspect/`** — Model analysis and metadata extraction
-- **`src/session.rs`** — ONNX Runtime session management and provider selection
-- **`src/pipeline.rs`** — High-level upscaling orchestration
-- **`src/tiling.rs`** — Tile grid computation and blending
-- **`src/imageio.rs`** — Image loading, saving, and format handling
-- **`src/commands/`** — CLI command implementations
-
-## Credits
-
-Built with:
-
-- [ort](https://github.com/pykeio/ort) — Safe Rust bindings for ONNX Runtime
-- [image](https://github.com/image-rs/image) — Pure Rust image encoding/decoding
-- [clap](https://github.com/clap-rs/clap) — Command-line argument parsing
-- [indicatif](https://github.com/console-rs/indicatif) — Progress bars and spinners
+MIT
 - [tracing](https://github.com/tokio-rs/tracing) — Structured logging
 
 ## License

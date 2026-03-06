@@ -1,5 +1,6 @@
 //! Upscaling pipeline: tiling, tensor conversion, and inference.
 
+pub mod blend;
 pub mod tensor;
 pub mod tiling;
 
@@ -51,6 +52,13 @@ pub struct UpscaleOptions {
 
 	/// Cancellation token — checked between tiles.
 	pub cancel: CancelToken,
+
+	/// Frequency-domain blend strength \[0.0, 1.0\].
+	///
+	/// `0.0` (default) — pure AI output, blending disabled.
+	/// `1.0` — AI supplies fine detail; Lanczos upscale of the original
+	///         supplies global structure (colour, tone, large shapes).
+	pub blend: f32,
 }
 
 impl Default for UpscaleOptions {
@@ -60,6 +68,7 @@ impl Default for UpscaleOptions {
 			tile_overlap: crate::config::DEFAULT_TILE_OVERLAP,
 			on_tile_done: None,
 			cancel: CancelToken::new(),
+			blend: 0.0,
 		}
 	}
 }
@@ -130,7 +139,14 @@ pub fn upscale_image(
 	// Normalise canvas by accumulated weights.
 	normalise_canvas(&mut canvas, &weight_map);
 
-	tensor_to_image(canvas.view(), out_channels)
+	let ai_result = tensor_to_image(canvas.view(), out_channels)?;
+
+	// Apply frequency-domain blending if requested.
+	if options.blend > 0.0 {
+		blend::frequency_blend_with_original(&ai_result, input, options.blend)
+	} else {
+		Ok(ai_result)
+	}
 }
 
 /// Run inference on a single tile.

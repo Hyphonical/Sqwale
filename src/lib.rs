@@ -11,5 +11,6 @@ pub mod session;
 
 // ── Convenience re-exports ──────────────────────────────────────────────────
 pub use inspect::{ColorSpace, ModelInfo, ScaleSource, TileInfo, inspect_model};
+pub use pipeline::blend::{frequency_blend, frequency_blend_with_original};
 pub use pipeline::{CancelToken, UpscaleOptions, upscale_image};
 pub use session::{ProviderSelection, SessionContext, load_model};

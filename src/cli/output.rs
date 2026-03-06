@@ -20,8 +20,6 @@ pub const SYM_ELLIPSIS: &str = "…";
 // ── Tree connectors ────────────────────────────────────────────────────────
 pub const TREE_BRANCH: &str = "├─";
 pub const TREE_LAST: &str = "╰─";
-#[allow(dead_code)]
-pub const TREE_PIPE: &str = "│";
 pub const TREE_SUB: &str = "│   └─";
 
 // ── Truecolor values ──────────────────────────────────────────────────────
@@ -69,7 +67,8 @@ pub fn should_show_progress() -> bool {
 /// Tile progress bar style (per-image).
 pub fn tile_bar_style() -> ProgressStyle {
 	ProgressStyle::default_bar()
-		.template("  {bar:40.cyan/238}  {msg}")
+		.tick_strings(SPINNER_FRAMES)
+		.template("  {spinner:.cyan} {bar:40.cyan/238}  {msg}")
 		.unwrap()
 		.progress_chars("━╌")
 }
@@ -77,7 +76,8 @@ pub fn tile_bar_style() -> ProgressStyle {
 /// Batch progress bar style (overall images).
 pub fn batch_bar_style() -> ProgressStyle {
 	ProgressStyle::default_bar()
-		.template("  {bar:40.cyan/238}  {msg}")
+		.tick_strings(SPINNER_FRAMES)
+		.template("  {spinner:.cyan} {bar:40.cyan/238}  {msg}")
 		.unwrap()
 		.progress_chars("━╌")
 }
@@ -102,19 +102,24 @@ pub fn with_spinner<T>(label: &str, f: impl FnOnce() -> T) -> T {
 	result
 }
 
-/// Print a tree row with aligned columns.
+/// Format a tree row as a String (without printing).
 ///
 /// Example: ` ├─ Scale      2x  via DepthToSpace`
-pub fn tree_row(prefix: &str, connector: &str, label: &str, label_width: usize, value: &str) {
-	// Pad the label before applying color so ANSI codes don't affect alignment.
+pub fn fmt_tree_row(
+	prefix: &str,
+	connector: &str,
+	label: &str,
+	label_width: usize,
+	value: &str,
+) -> String {
 	let padded = format!("{:width$}", label, width = label_width);
-	println!(
+	format!(
 		"{}{} {}{}",
 		prefix,
 		connector.dimmed(),
 		padded.white(),
-		value,
-	);
+		value
+	)
 }
 
 /// Format dimensions as "W×H" with bold bright-white numbers.

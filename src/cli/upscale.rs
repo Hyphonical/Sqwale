@@ -82,6 +82,7 @@ pub fn run(
 	let tile_overlap = args
 		.tile_overlap
 		.unwrap_or(sqwale::config::DEFAULT_TILE_OVERLAP);
+	let blend = args.blend;
 
 	let show_progress = should_show_progress();
 
@@ -94,6 +95,7 @@ pub fn run(
 			&model_filename,
 			tile_size,
 			tile_overlap,
+			blend,
 			show_progress,
 			&cancel,
 		)
@@ -106,6 +108,7 @@ pub fn run(
 			&model_filename,
 			tile_size,
 			tile_overlap,
+			blend,
 			show_progress,
 			&cancel,
 		)
@@ -122,6 +125,7 @@ fn run_single(
 	model_filename: &str,
 	tile_size: u32,
 	tile_overlap: u32,
+	blend: f32,
 	show_progress: bool,
 	cancel: &CancelToken,
 ) -> Result<()> {
@@ -174,7 +178,9 @@ fn run_single(
 
 	// Setup progress bar.
 	let pb = if show_progress {
-		Some(ProgressBar::new(0).with_style(tile_bar_style()))
+		let pb = ProgressBar::new(0).with_style(tile_bar_style());
+		pb.enable_steady_tick(Duration::from_millis(SPINNER_TICK_MS));
+		Some(pb)
 	} else {
 		None
 	};
@@ -183,6 +189,7 @@ fn run_single(
 	let options = UpscaleOptions {
 		tile_size,
 		tile_overlap,
+		blend,
 		cancel: cancel.clone(),
 		on_tile_done: Some(Box::new(move |done, total| {
 			if let Some(ref pb) = pb_clone {
@@ -244,6 +251,7 @@ fn run_batch(
 	model_filename: &str,
 	tile_size: u32,
 	tile_overlap: u32,
+	blend: f32,
 	show_progress: bool,
 	cancel: &CancelToken,
 ) -> Result<()> {
@@ -301,9 +309,19 @@ fn run_batch(
 		None
 	};
 
+	// Pre-create both bars in the MultiProgress so they coexist:
+	// tile bar on top, batch bar on bottom.
+	let tile_pb = multi.as_ref().map(|mp| {
+		let pb = mp.add(ProgressBar::new(0));
+		pb.set_style(tile_bar_style());
+		pb.enable_steady_tick(Duration::from_millis(SPINNER_TICK_MS));
+		pb
+	});
+
 	let batch_pb = multi.as_ref().map(|mp| {
 		let pb = mp.add(ProgressBar::new(inputs.len() as u64));
 		pb.set_style(batch_bar_style());
+		pb.enable_steady_tick(Duration::from_millis(SPINNER_TICK_MS));
 		pb
 	});
 
@@ -312,37 +330,67 @@ fn run_batch(
 	let mut failed: Vec<(PathBuf, String)> = Vec::new();
 	let mut skipped = 0usize;
 
+	let print_line = |multi: &Option<MultiProgress>, line: String| {
+		if let Some(mp) = multi {
+			let _ = mp.println(&line);
+		} else {
+			println!("{line}");
+		}
+	};
+
 	for (i, input) in inputs.iter().enumerate() {
 		if cancel.is_cancelled() {
 			skipped = inputs.len() - i;
-			println!(
-				"\n{} {} {}",
-				SYM_WARN.yellow(),
-				"Interrupted".white(),
-				"— finishing current image, skipping remaining".dimmed()
+			print_line(
+				&multi,
+				format!(
+					"\n{} {} {}",
+					SYM_WARN.yellow(),
+					"Interrupted".white(),
+					"— finishing current image, skipping remaining".dimmed()
+				),
 			);
 			break;
 		}
 
+		// Update batch bar.
+		if let Some(ref pb) = batch_pb {
+			pb.set_position(i as u64);
+			update_batch_message(pb, i, inputs.len(), batch_start);
+		}
+
+		// Reset tile bar for this image.
+		if let Some(ref pb) = tile_pb {
+			pb.reset();
+			pb.set_length(0);
+			pb.set_message("".to_string());
+		}
+
 		// Per-image header.
-		println!(
-			"{} {}{}{} {}",
-			SYM_BULLET.cyan().bold(),
-			"[".dimmed(),
-			(i + 1).to_string().bold().bright_white(),
-			format!("/{}]", inputs.len()).dimmed(),
-			path_str(&input.display().to_string())
+		print_line(
+			&multi,
+			format!(
+				"{} {}{}{} {}",
+				SYM_BULLET.cyan().bold(),
+				"[".dimmed(),
+				(i + 1).to_string().bold().bright_white(),
+				format!("/{}]", inputs.len()).dimmed(),
+				path_str(&input.display().to_string())
+			),
 		);
 
 		let output_path = match resolve_batch_output(input, output_dir, scale) {
 			Ok(p) => p,
 			Err(e) => {
 				failed.push((input.clone(), format!("{e:#}")));
-				println!(
-					"  {} {} {}",
-					SYM_CROSS.red().bold(),
-					"Failed to resolve output path".white(),
-					format!("{e:#}").dimmed()
+				print_line(
+					&multi,
+					format!(
+						"  {} {} {}",
+						SYM_CROSS.red().bold(),
+						"Failed to resolve output path".white(),
+						format!("{e:#}").dimmed()
+					),
 				);
 				continue;
 			}
@@ -354,9 +402,10 @@ fn run_batch(
 			ctx,
 			tile_size,
 			tile_overlap,
+			blend,
 			cancel,
-			show_progress,
-			multi.as_ref(),
+			tile_pb.as_ref(),
+			&multi,
 		) {
 			Ok(()) => {
 				succeeded += 1;
@@ -368,29 +417,31 @@ fn run_batch(
 					break;
 				}
 				failed.push((input.clone(), msg.clone()));
-				println!(
-					"  {} {} {}",
-					SYM_CROSS.red().bold(),
-					"Failed to decode image".white(),
-					format!(": {msg}").dimmed()
+				print_line(
+					&multi,
+					format!(
+						"  {} {} {}",
+						SYM_CROSS.red().bold(),
+						"Failed".white(),
+						format!(": {msg}").dimmed()
+					),
 				);
 			}
 		}
 
+		// Update batch bar after completing this image.
 		if let Some(ref pb) = batch_pb {
 			pb.set_position((i + 1) as u64);
-			let elapsed = batch_start.elapsed();
-			pb.set_message(format!(
-				"{}/{}  images  {} elapsed",
-				(i + 1).to_string().bold().bright_white(),
-				inputs.len(),
-				format_duration(elapsed).dimmed(),
-			));
+			update_batch_message(pb, i + 1, inputs.len(), batch_start);
 		}
 
-		println!();
+		print_line(&multi, String::new());
 	}
 
+	// Clear both bars.
+	if let Some(ref pb) = tile_pb {
+		pb.finish_and_clear();
+	}
 	if let Some(ref pb) = batch_pb {
 		pb.finish_and_clear();
 	}
@@ -452,7 +503,28 @@ fn run_batch(
 	Ok(())
 }
 
+/// Update the batch progress bar message with elapsed time and ETA.
+fn update_batch_message(pb: &ProgressBar, done: usize, total: usize, start: Instant) {
+	let elapsed = start.elapsed();
+	let eta = if done > 0 {
+		let avg = elapsed / done as u32;
+		let remaining = total.saturating_sub(done);
+		format!("  ~{} remaining", format_duration(avg * remaining as u32)).dimmed()
+	} else {
+		"".dimmed()
+	};
+	pb.set_message(format!(
+		"{}/{}  images  {}{}",
+		done.to_string().bold().bright_white(),
+		total,
+		format_duration(elapsed).dimmed(),
+		eta,
+	));
+}
+
 /// Process a single image within a batch.
+///
+/// The tile progress bar is owned by the caller and reused across images.
 #[allow(clippy::too_many_arguments)]
 fn process_single_image(
 	input: &Path,
@@ -460,36 +532,36 @@ fn process_single_image(
 	ctx: &mut sqwale::SessionContext,
 	tile_size: u32,
 	tile_overlap: u32,
+	blend: f32,
 	cancel: &CancelToken,
-	show_progress: bool,
-	multi: Option<&MultiProgress>,
+	tile_pb: Option<&ProgressBar>,
+	multi: &Option<MultiProgress>,
 ) -> Result<()> {
+	let print_line = |line: String| {
+		if let Some(mp) = multi {
+			let _ = mp.println(&line);
+		} else {
+			println!("{line}");
+		}
+	};
+
 	let img = imageio::load_image(input)?;
 	let (img_w, img_h) = (img.width(), img.height());
 
-	println!(
+	print_line(format!(
 		"  {} {} {}",
 		SYM_DOT.dimmed(),
 		"Input".dimmed(),
 		dims_str(img_w, img_h)
-	);
+	));
 
 	let start = Instant::now();
 
-	let tile_pb = if show_progress {
-		let pb = multi
-			.map(|mp| mp.add(ProgressBar::new(0)))
-			.unwrap_or_else(|| ProgressBar::new(0));
-		pb.set_style(tile_bar_style());
-		Some(pb)
-	} else {
-		None
-	};
-
-	let pb_clone = tile_pb.clone();
+	let pb_clone = tile_pb.cloned();
 	let options = UpscaleOptions {
 		tile_size,
 		tile_overlap,
+		blend,
 		cancel: cancel.clone(),
 		on_tile_done: Some(Box::new(move |done, total| {
 			if let Some(ref pb) = pb_clone {
@@ -514,29 +586,31 @@ fn process_single_image(
 
 	let result = sqwale::pipeline::upscale_image(ctx, &img, &options);
 
-	if let Some(ref pb) = tile_pb {
-		pb.finish_and_clear();
+	// Clear the tile bar but don't remove it from MultiProgress — it's reused.
+	if let Some(pb) = tile_pb {
+		pb.set_position(pb.length().unwrap_or(0));
+		pb.set_message("".to_string());
 	}
 
 	let output_img = result?;
 	let elapsed = start.elapsed();
 
 	let (out_w, out_h) = (output_img.width(), output_img.height());
-	println!(
+	print_line(format!(
 		"  {} {} {}",
 		SYM_DOT.dimmed(),
 		"Output".dimmed(),
 		dims_str(out_w, out_h)
-	);
+	));
 
 	imageio::save_image(&output_img, output_path)?;
 
-	println!(
+	print_line(format!(
 		"  {} {}  {}",
 		SYM_CHECK.green(),
 		path_str(&output_path.display().to_string()),
 		format_duration(elapsed).dimmed()
-	);
+	));
 
 	Ok(())
 }

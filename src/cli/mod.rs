@@ -24,6 +24,24 @@ pub struct Cli {
 	/// Overlap in pixels between adjacent tiles.
 	#[arg(long, global = true)]
 	pub tile_overlap: Option<u32>,
+
+	/// Blend AI upscale with a Lanczos upscale via an FFT Laplacian pyramid [0.0–1.0].
+	///
+	/// 0.0 (default) disables blending. 1.0 makes the AI supply fine detail while
+	/// the Lanczos upscale of the original supplies global structure and colour.
+	#[arg(long, global = true, default_value_t = 0.0, value_parser = parse_blend)]
+	pub blend: f32,
+}
+
+fn parse_blend(s: &str) -> Result<f32, String> {
+	let v: f32 = s
+		.parse()
+		.map_err(|_| format!("'{s}' is not a valid number"))?;
+	if (0.0..=1.0).contains(&v) {
+		Ok(v)
+	} else {
+		Err(format!("blend value {v} is out of range, must be 0.0–1.0"))
+	}
 }
 
 #[derive(Subcommand)]
