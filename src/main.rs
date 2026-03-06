@@ -1,22 +1,40 @@
-//! CLI entry point for sqwale.
+//! Sqwale CLI entry point.
 
 mod cli;
-mod commands;
 
 use anyhow::Result;
 use clap::Parser;
-use cli::{Cli, Commands};
 
 fn main() -> Result<()> {
-	let cli = Cli::parse();
+	// Suppress ORT diagnostic output unless the user has set a preference.
+	if std::env::var("ORT_LOG_SEVERITY_LEVEL").is_err() {
+		// SAFETY: Called before any threads are spawned and before ORT init.
+		unsafe { std::env::set_var("ORT_LOG_SEVERITY_LEVEL", "3") };
+	}
 
-	match &cli.command {
-		Commands::Inspect { pattern } => commands::inspect::run(pattern, cli.verbose, cli.quiet),
-		Commands::Upscale {
+	// Disable colored output in CI environments.
+	if !cli::output::should_use_color() {
+		colored::control::set_override(false);
+	}
+
+	// Initialize tracing with indicatif integration.
+	cli::output::init_tracing();
+
+	// Parse CLI arguments and dispatch.
+	let args = cli::Cli::parse();
+
+	match &args.command {
+		cli::Commands::Inspect { pattern } => {
+			cli::inspect::run(pattern)?;
+		}
+		cli::Commands::Upscale {
 			input,
 			model,
 			output,
-			provider,
-		} => commands::upscale::run(input, model, output.as_deref(), provider, cli.quiet),
+		} => {
+			cli::upscale::run(input, model, output.as_deref(), &args)?;
+		}
 	}
+
+	Ok(())
 }

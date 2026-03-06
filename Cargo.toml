@@ -1,11 +1,12 @@
 [package]
 name         = "sqwale"
-version      = "0.1.0"
-edition      = "2021"
-rust-version = "1.82.0"
+version      = "0.2.0"
+edition      = "2024"
+rust-version = "1.85.0"
 authors      = ["Hyphonical"]
 license      = "MIT"
 repository   = "https://github.com/Hyphonical/Sqwale"
+description  = "ONNX super-resolution inference library and CLI"
 
 [[bin]]
 name = "sqwale"
@@ -16,25 +17,31 @@ name = "sqwale"
 path = "src/lib.rs"
 
 [dependencies]
-# Model Loading & Inference
+# ── Model Loading & Inference ──────────────────────────────────────────────
 ort     = { version = "2.0.0-rc.12", features = ["api-24", "half"] }
 ndarray = "0.17"
 half    = "2"
 
-# Image Processing
-image = { version = "0.25", default-features = false, features = ["png", "jpeg", "webp"] }
+# ── Image Processing ──────────────────────────────────────────────────────
+image = { version = "0.25", default-features = false, features = [
+    "png", "jpeg", "webp", "gif", "tiff", "bmp", "ico",
+    "pnm", "qoi", "hdr",
+] }
 
-# CLI & Output
-clap    = { version = "4", features = ["derive"] }
-treelog = { version = "0.0.6", features = ["color"] }
-colored = "3"
-indicatif = "0.17"
-ctrlc = "3"
+# ── CLI & Output ──────────────────────────────────────────────────────────
+clap      = { version = "4", features = ["derive"] }
+colored   = "3"
+indicatif = "0.18"
+ctrlc     = "3"
 
-# Utilities
-anyhow    = "1"
-glob      = "0.3"
-num_cpus = "1"
+# ── Logging ───────────────────────────────────────────────────────────────
+tracing            = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+tracing-indicatif  = "0.3"
+
+# ── Utilities ─────────────────────────────────────────────────────────────
+anyhow = "1"
+glob   = "0.3"
 
 [profile.release]
 opt-level     = "z"

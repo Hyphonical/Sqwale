@@ -1,0 +1,19 @@
+{
+    "chat.tools.terminal.autoApprove": {
+        "/^cargo build --profile fast$/": {
+            "approve": true,
+            "matchCommandLine": true
+        },
+        "/^cargo clippy --all-targets$/": {
+            "approve": true,
+            "matchCommandLine": true
+        },
+        "/^cargo fmt && cargo clippy --all-targets -- -D warnings$/": {
+            "approve": true,
+            "matchCommandLine": true
+        },
+        "cargo check": true,
+        "cargo clippy": true,
+        "cargo test": true
+    }
+}
