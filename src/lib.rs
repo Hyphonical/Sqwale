@@ -6,7 +6,7 @@
 // 4xSPANkendata — https://openmodeldb.info/models/4x-SPANkendata
 // License: CC-BY-SA-4.0  (https://creativecommons.org/licenses/by-sa/4.0/)
 // Author: terrainer — https://github.com/terrainer/AI-Upscaling-Models
-pub const DEFAULT_MODEL_BYTES: &[u8] = include_bytes!("../model.onnx");
+pub const DEFAULT_MODEL_BYTES: &[u8] = include_bytes!("../4x-Rybu.onnx");
 
 // ── Public modules ──────────────────────────────────────────────────────────
 pub mod config;
