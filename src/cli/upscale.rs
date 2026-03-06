@@ -215,7 +215,7 @@ fn run_single(
 					Duration::ZERO
 				};
 				pb.set_message(format!(
-					"{}/{} tiles  {}  {}/tile",
+					"{}/{} Upscaling…  {}  {}/tile",
 					done.to_string().bold().bright_white(),
 					total,
 					format_duration(elapsed).dimmed(),
@@ -229,7 +229,7 @@ fn run_single(
 					pb.set_length(total as u64);
 					pb.set_position(done as u64);
 					pb.set_message(format!(
-						"{}/{} blend  {}",
+						"{}/{} Blending…  {}",
 						done.to_string().bold().bright_white(),
 						total,
 						format_duration(start.elapsed()).dimmed(),
@@ -604,7 +604,7 @@ fn process_single_image(
 					Duration::ZERO
 				};
 				pb.set_message(format!(
-					"{}/{} tiles  {}  {}/tile",
+					"{}/{} Upscaling…  {}  {}/tile",
 					done.to_string().bold().bright_white(),
 					total,
 					format_duration(elapsed).dimmed(),
@@ -618,7 +618,7 @@ fn process_single_image(
 					pb.set_length(total as u64);
 					pb.set_position(done as u64);
 					pb.set_message(format!(
-						"{}/{} blend  {}",
+						"{}/{} Blending…  {}",
 						done.to_string().bold().bright_white(),
 						total,
 						format_duration(start.elapsed()).dimmed(),

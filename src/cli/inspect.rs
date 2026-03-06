@@ -39,9 +39,10 @@ pub fn run(pattern: &str) -> Result<()> {
 	for (i, path) in paths.iter().enumerate() {
 		if let Some(ref pb) = pb {
 			pb.set_message(format!(
-				"{}/{} models",
+				"{}/{} Inspecting… {}",
 				(i + 1).to_string().bold().bright_white(),
-				paths.len()
+				paths.len(),
+				path.display()
 			));
 			pb.set_position(i as u64);
 		}
