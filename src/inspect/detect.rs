@@ -14,11 +14,15 @@ type IoParseResult = (u32, (Option<u64>, Option<u64>), String);
 pub fn inspect_model(path: &Path) -> Result<ModelInfo> {
 	let file_bytes =
 		fs::read(path).with_context(|| format!("Failed to read model: {}", path.display()))?;
+	inspect_model_bytes(&file_bytes)
+}
 
-	let nodes = proto::extract_nodes(&file_bytes);
-	let opset = proto::extract_opset(&file_bytes);
-	let metadata = proto::extract_metadata(&file_bytes);
-	let (input_io, output_io) = proto::extract_io_from_proto(&file_bytes);
+/// Inspect an ONNX model from raw bytes and extract all metadata.
+pub fn inspect_model_bytes(file_bytes: &[u8]) -> Result<ModelInfo> {
+	let nodes = proto::extract_nodes(file_bytes);
+	let opset = proto::extract_opset(file_bytes);
+	let metadata = proto::extract_metadata(file_bytes);
+	let (input_io, output_io) = proto::extract_io_from_proto(file_bytes);
 
 	let (input_channels, input_spatial, input_dtype) = parse_io(input_io)?;
 	let (output_channels, output_spatial, output_dtype) =

@@ -3,7 +3,7 @@
 mod detect;
 pub(crate) mod proto;
 
-pub use detect::inspect_model;
+pub use detect::{inspect_model, inspect_model_bytes};
 
 // ── Color Space ────────────────────────────────────────────────────────────
 

@@ -18,7 +18,7 @@ use super::output::*;
 /// Run the upscale command.
 pub fn run(
 	input_pattern: &str,
-	model_path: &str,
+	model_path: Option<&str>,
 	output_arg: Option<&str>,
 	args: &Cli,
 ) -> Result<()> {
@@ -69,15 +69,27 @@ pub fn run(
 	}
 
 	// Load model with spinner.
-	let model_p = Path::new(model_path);
-	let mut ctx = with_spinner("Loading model…", || {
-		session::load_model(model_p, provider)
-	})
-	.with_context(|| format!("Failed to load model: {model_path}"))?;
+	let (mut ctx, model_filename) = if let Some(path) = model_path {
+		let model_p = Path::new(path);
+		let ctx = with_spinner("Loading model…", || {
+			session::load_model(model_p, provider)
+		})
+		.with_context(|| format!("Failed to load model: {path}"))?;
+		let name = model_p
+			.file_name()
+			.unwrap_or_default()
+			.to_string_lossy()
+			.into_owned();
+		(ctx, name)
+	} else {
+		let ctx = with_spinner("Loading model…", || {
+			session::load_model_bytes(sqwale::DEFAULT_MODEL_BYTES, provider)
+		})
+		.context("Failed to load built-in model")?;
+		(ctx, "embedded model".to_owned())
+	};
 
 	let scale = ctx.model_info.scale;
-	let model_filename = model_p.file_name().unwrap_or_default().to_string_lossy();
-
 	let tile_size = args.tile_size.unwrap_or(sqwale::config::DEFAULT_TILE_SIZE);
 	let tile_overlap = args
 		.tile_overlap
@@ -186,6 +198,7 @@ fn run_single(
 	};
 
 	let pb_clone = pb.clone();
+	let pb_blend_clone = pb.clone();
 	let options = UpscaleOptions {
 		tile_size,
 		tile_overlap,
@@ -210,6 +223,22 @@ fn run_single(
 				));
 			}
 		})),
+		on_blend_step: if show_progress && blend > 0.0 {
+			Some(Box::new(move |done, total| {
+				if let Some(ref pb) = pb_blend_clone {
+					pb.set_length(total as u64);
+					pb.set_position(done as u64);
+					pb.set_message(format!(
+						"{}/{} blend  {}",
+						done.to_string().bold().bright_white(),
+						total,
+						format_duration(start.elapsed()).dimmed(),
+					));
+				}
+			}))
+		} else {
+			None
+		},
 	};
 
 	let result = sqwale::pipeline::upscale_image(ctx, &img, &options);
@@ -558,6 +587,7 @@ fn process_single_image(
 	let start = Instant::now();
 
 	let pb_clone = tile_pb.cloned();
+	let pb_blend_clone = tile_pb.cloned();
 	let options = UpscaleOptions {
 		tile_size,
 		tile_overlap,
@@ -582,6 +612,22 @@ fn process_single_image(
 				));
 			}
 		})),
+		on_blend_step: if blend > 0.0 {
+			Some(Box::new(move |done, total| {
+				if let Some(ref pb) = pb_blend_clone {
+					pb.set_length(total as u64);
+					pb.set_position(done as u64);
+					pb.set_message(format!(
+						"{}/{} blend  {}",
+						done.to_string().bold().bright_white(),
+						total,
+						format_duration(start.elapsed()).dimmed(),
+					));
+				}
+			}))
+		} else {
+			None
+		},
 	};
 
 	let result = sqwale::pipeline::upscale_image(ctx, &img, &options);

@@ -58,8 +58,9 @@ pub enum Commands {
 		input: String,
 
 		/// Path to the ONNX model file.
+		/// If omitted, the bundled 4xSPANkendata model is used.
 		#[arg(short, long)]
-		model: String,
+		model: Option<String>,
 
 		/// Output file path or directory.
 		/// Omit to write next to the input as `{stem}_{scale}x.{ext}`.

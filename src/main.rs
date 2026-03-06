@@ -32,7 +32,7 @@ fn main() -> Result<()> {
 			model,
 			output,
 		} => {
-			cli::upscale::run(input, model, output.as_deref(), &args)?;
+			cli::upscale::run(input, model.as_deref(), output.as_deref(), &args)?;
 		}
 	}
 

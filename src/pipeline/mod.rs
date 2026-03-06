@@ -50,6 +50,11 @@ pub struct UpscaleOptions {
 	/// Arguments: (tiles_completed, total_tiles).
 	pub on_tile_done: Option<Box<dyn Fn(usize, usize) + Send + Sync>>,
 
+	/// Optional callback invoked after each major blend step completes.
+	/// Arguments: (steps_completed, total_steps).
+	/// Only called when `blend > 0.0`.
+	pub on_blend_step: Option<Box<dyn Fn(usize, usize) + Send + Sync>>,
+
 	/// Cancellation token — checked between tiles.
 	pub cancel: CancelToken,
 
@@ -67,6 +72,7 @@ impl Default for UpscaleOptions {
 			tile_size: crate::config::DEFAULT_TILE_SIZE,
 			tile_overlap: crate::config::DEFAULT_TILE_OVERLAP,
 			on_tile_done: None,
+			on_blend_step: None,
 			cancel: CancelToken::new(),
 			blend: 0.0,
 		}
@@ -143,7 +149,11 @@ pub fn upscale_image(
 
 	// Apply frequency-domain blending if requested.
 	if options.blend > 0.0 {
-		blend::frequency_blend_with_original(&ai_result, input, options.blend)
+		let blend_cb = options
+			.on_blend_step
+			.as_ref()
+			.map(|cb| cb.as_ref() as &dyn Fn(usize, usize));
+		blend::frequency_blend_with_original(&ai_result, input, options.blend, blend_cb)
 	} else {
 		Ok(ai_result)
 	}

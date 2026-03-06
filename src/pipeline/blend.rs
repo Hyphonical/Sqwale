@@ -26,6 +26,7 @@ pub fn frequency_blend_with_original(
 	ai: &DynamicImage,
 	original: &DynamicImage,
 	blend: f32,
+	on_step: Option<&dyn Fn(usize, usize)>,
 ) -> Result<DynamicImage> {
 	if blend <= 0.0 {
 		return Ok(ai.clone());
@@ -35,7 +36,7 @@ pub fn frequency_blend_with_original(
 		ai.height(),
 		image::imageops::FilterType::Lanczos3,
 	);
-	frequency_blend(ai, &lanczos, blend)
+	frequency_blend(ai, &lanczos, blend, on_step)
 }
 
 /// Blend `ai` and `lanczos` (same dimensions) via a single-pass frequency-domain
@@ -44,6 +45,7 @@ pub fn frequency_blend(
 	ai: &DynamicImage,
 	lanczos: &DynamicImage,
 	blend: f32,
+	on_step: Option<&dyn Fn(usize, usize)>,
 ) -> Result<DynamicImage> {
 	let blend = blend.clamp(0.0, 1.0);
 	if blend <= 0.0 {
@@ -95,6 +97,7 @@ pub fn frequency_blend(
 	let norm = 1.0 / pixels as f32;
 
 	// ── Per-channel: 2 forward FFTs + blend + 1 inverse FFT ─────────────
+	let total_steps = n_ch * 3;
 	for ch in 0..n_ch {
 		// Forward 2-D R2C FFT of AI channel
 		forward_r2c_2d(
@@ -112,6 +115,9 @@ pub fn frequency_blend(
 			&mut col_scratch,
 			&mut spec_a,
 		);
+		if let Some(cb) = on_step {
+			cb(ch * 3 + 1, total_steps);
+		}
 
 		// Forward 2-D R2C FFT of Lanczos channel
 		forward_r2c_2d(
@@ -129,6 +135,9 @@ pub fn frequency_blend(
 			&mut col_scratch,
 			&mut spec_l,
 		);
+		if let Some(cb) = on_step {
+			cb(ch * 3 + 2, total_steps);
+		}
 
 		// Blend in the frequency domain:  out = LZ + (AI − LZ) · H_ai
 		for i in 0..spec_len {
@@ -152,6 +161,9 @@ pub fn frequency_blend(
 			&mut col_scratch,
 			&mut out_raw,
 		);
+		if let Some(cb) = on_step {
+			cb(ch * 3 + 3, total_steps);
+		}
 	}
 
 	Ok(raw_to_image(out_raw, w as u32, h as u32, n_ch))
@@ -193,8 +205,8 @@ fn build_transfer_function(w: usize, h: usize, sigmas: &[f32], blend: f32) -> Ve
 			let mut g_prev = 1.0f32;
 			let mut val = 0.0f32;
 
-			for k in 0..n {
-				let g_curr = (neg_c[k] * freq_sq).exp();
+			for (k, &neg_ck) in neg_c.iter().enumerate() {
+				let g_curr = (neg_ck * freq_sq).exp();
 				let ai_weight = 1.0 - blend * k as f32 * inv_n_minus_1;
 				val += ai_weight * (g_prev - g_curr);
 				g_prev = g_curr;
@@ -212,6 +224,9 @@ fn build_transfer_function(w: usize, h: usize, sigmas: &[f32], blend: f32) -> Ve
 
 /// Row-wise R2C then column-wise complex FFT.
 /// Reads one channel directly from interleaved u8 raw bytes (zero extra copies).
+// All buffer arguments are pre-allocated by the caller and reused across channels
+// to avoid per-channel heap allocations in this hot path.
+#[allow(clippy::too_many_arguments)]
 fn forward_r2c_2d(
 	raw: &[u8],
 	stride: usize,
@@ -256,6 +271,9 @@ fn forward_r2c_2d(
 
 /// Column-wise complex IFFT then row-wise C2R.
 /// Normalises, clamps, and writes directly into interleaved u8 output bytes.
+// All buffer arguments are pre-allocated by the caller and reused across channels
+// to avoid per-channel heap allocations in this hot path.
+#[allow(clippy::too_many_arguments)]
 fn inverse_c2r_2d(
 	spectrum: &mut [Complex<f32>],
 	w: usize,
@@ -348,7 +366,7 @@ mod tests {
 		let original = DynamicImage::ImageRgb8(image::RgbImage::from_fn(4, 4, |x, y| {
 			image::Rgb([(x * 60) as u8, (y * 60) as u8, 64])
 		}));
-		let result = frequency_blend_with_original(&ai, &original, 0.0).unwrap();
+		let result = frequency_blend_with_original(&ai, &original, 0.0, None).unwrap();
 		assert_eq!(result.to_rgb8().as_raw(), ai.to_rgb8().as_raw());
 	}
 
@@ -357,7 +375,7 @@ mod tests {
 		let img = DynamicImage::ImageRgb8(image::RgbImage::from_fn(16, 16, |x, y| {
 			image::Rgb([(x * 15) as u8, (y * 15) as u8, 100])
 		}));
-		let result = frequency_blend(&img, &img, 1.0).unwrap();
+		let result = frequency_blend(&img, &img, 1.0, None).unwrap();
 		let a = img.to_rgb8();
 		let b = result.to_rgb8();
 		for (pa, pb) in a.pixels().zip(b.pixels()) {
