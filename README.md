@@ -56,7 +56,7 @@ sqwale inspect models/
 ### Upscale Images
 
 ```bash
-# Single image (output: input_2x.png)
+# Single image (output: input_4x.png)
 sqwale upscale input.png -m model.onnx
 
 # Explicit output path
@@ -67,15 +67,18 @@ sqwale upscale "photos/*.jpg" -m model.onnx -o upscaled/
 
 # Custom tiling
 sqwale upscale input.png -m model.onnx --tile-size 768 --tile-overlap 32
+
+# Frequency-domain blending with Lanczos upscale
+sqwale upscale input.png -m model.onnx --blend 0.5
 ```
 
 ```
 ● input.jpg
-·  Model 2x · RGB · float32 · dynamic  model.onnx via auto
+·  Model 4x · RGB · float32 · dynamic  model.onnx via auto
 ·  Input 4000×6000
-  ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━  117/117 tiles  27s  0.2s/tile
-·  Output 8000×12000
-✓ input_2x.jpg  27s
+  ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━  117/117 Upscaling…  27s  0.2s/tile
+·  Output 16000×24000
+✓ input_4x.jpg  27s
 ```
 
 Batch mode shows dual progress bars — per-image tile progress on top, overall batch progress with ETA on the bottom:
@@ -94,6 +97,7 @@ Batch mode shows dual progress bars — per-image tile progress on top, overall 
 | `--provider <name>` | Execution provider: `auto`, `cpu`, `cuda`, `tensorrt`, `directml`, `coreml`, `xnnpack` | `auto` |
 | `--tile-size <px>` | Tile size in pixels (`0` = no tiling) | `512` |
 | `--tile-overlap <px>` | Overlap between adjacent tiles | `16` |
+| `--blend <0.0–1.0>` | Blend AI output with Lanczos upscale via FFT Laplacian pyramid | `0.0` |
 
 ### Provider Selection
 
@@ -133,10 +137,11 @@ Sqwale works with ONNX super-resolution models using:
 - NCHW layout, RGB (3-channel) input/output
 - float32 or float16 precision
 - `[0, 1]` normalization range
-
-Scale factor, tiling support, and data types are detected automatically from the ONNX graph.
+- Scale detection via DepthToSpace, ConvTranspose, Resize, metadata, or static shape ratio
 
 **Where to find models:** [OpenModelDB](https://openmodeldb.info) · [upscale.wiki](https://upscale.wiki)
+
+The bundled default model is [4xLSDIRCompactv2](https://openmodeldb.info/models/4x-LSDIRCompact-v2) by Phhofm, licensed under [CC-BY-4.0](https://creativecommons.org/licenses/by/4.0/).
 
 ## Environment Variables
 
@@ -146,22 +151,9 @@ Scale factor, tiling support, and data types are detected automatically from the
 | `CI` | Disable colors and progress bars |
 | `RUST_LOG` | Log verbosity (e.g. `sqwale=debug`) |
 
-## Roadmap
-
-Potential future directions:
-
-- **Video frame upscaling** — extract frames, upscale individually, reassemble. Batch processing already handles the core loop; integration with FFmpeg for decode/encode is the main work.
-- **Frame interpolation** — generate intermediate frames for smooth slow-motion or framerate conversion. A different class of models but a natural companion to spatial upscaling.
-- **Parallel image processing** — process multiple images concurrently using separate sessions, improving throughput on multi-GPU systems or when tiles leave GPU headroom.
-
 ## License
 
-MIT
-- [tracing](https://github.com/tokio-rs/tracing) — Structured logging
-
-## License
-
-MIT License - see [LICENSE](LICENSE) for details.
+MIT License — see [LICENSE](LICENSE) for details.
 
 ## Contributing
 
@@ -170,19 +162,3 @@ Contributions welcome! Please:
 1. Run `cargo fmt` and `cargo clippy` before submitting
 2. Follow Rust idioms and existing code style
 3. Add tests for new features
-4. Update PLAN.md if changing architecture or design decisions
-
-## Roadmap
-
-Potential future enhancements:
-
-- [ ] Custom normalization profiles per model (YAML/TOML config)
-- [ ] Multi-threading for batch processing
-- [ ] Video frame upscaling
-- [ ] Alternative color spaces (RGBA, grayscale)
-- [ ] Model quantization and optimization
-- [ ] Web UI or service mode
-
----
-
-**Made with ❤️ by [Hyphonical](https://github.com/Hyphonical)**

@@ -49,6 +49,7 @@ pub enum ScaleSource {
 	StaticShapeRatio,
 	DepthToSpace,
 	ConvTransposeStride,
+	Resize,
 	#[default]
 	Assumed,
 }
@@ -60,6 +61,7 @@ impl std::fmt::Display for ScaleSource {
 			Self::StaticShapeRatio => write!(f, "static shape ratio"),
 			Self::DepthToSpace => write!(f, "DepthToSpace (PixelShuffle)"),
 			Self::ConvTransposeStride => write!(f, "ConvTranspose stride"),
+			Self::Resize => write!(f, "Resize scales initializer"),
 			Self::Assumed => write!(f, "assumed (no upscale op found)"),
 		}
 	}

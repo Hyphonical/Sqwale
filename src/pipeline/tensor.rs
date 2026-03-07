@@ -124,11 +124,6 @@ pub fn tensor_f32_to_f16(tensor: &Array4<f32>) -> Array4<half::f16> {
 	tensor.mapv(half::f16::from_f32)
 }
 
-/// Convert an f16 output tensor back to f32.
-pub fn tensor_f16_to_f32(tensor: ArrayView4<half::f16>) -> Array4<f32> {
-	tensor.mapv(half::f16::to_f32)
-}
-
 /// Apply mirror padding to a tensor.
 ///
 /// Extends each spatial dimension by reflecting pixel values.

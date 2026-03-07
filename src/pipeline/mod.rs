@@ -79,32 +79,19 @@ impl Default for UpscaleOptions {
 	}
 }
 
-/// Upscale a single image using the provided session and model info.
+/// Run inference on a single image, returning the raw AI output.
 ///
-/// This is the primary library entry point for upscaling. It handles:
-/// - Converting the input image to the appropriate tensor format.
-/// - Computing the tile grid (or running whole-image if tiling disabled).
-/// - Running inference on each tile.
-/// - Blending overlapping tiles with Hann-window weights.
-/// - Converting the output tensor back to a `DynamicImage`.
-///
-/// The caller is responsible for loading/saving images and displaying
-/// progress — this function only reports via `options.on_tile_done`.
-pub fn upscale_image(
+/// This performs tiling, tensor conversion, and inference but does **not**
+/// apply frequency-domain blending. Useful when you want to drop the session
+/// (freeing GPU memory) before blending and saving.
+pub fn upscale_raw(
 	ctx: &mut SessionContext,
 	input: &DynamicImage,
 	options: &UpscaleOptions,
 ) -> Result<DynamicImage> {
-	// Clone model_info to avoid holding an immutable borrow on ctx
-	// while passing &mut ctx to run_tile.
 	let model_info = ctx.model_info.clone();
-	let scale = model_info.scale;
-	let out_channels = model_info.output_channels;
 	let (img_w, img_h) = (input.width(), input.height());
-	let out_w = img_w * scale;
-	let out_h = img_h * scale;
 
-	// Compute tile grid.
 	let tiles = compute_tile_grid(
 		img_w,
 		img_h,
@@ -114,26 +101,45 @@ pub fn upscale_image(
 	)?;
 	let total_tiles = tiles.len();
 
-	// Allocate output accumulators.
-	let mut canvas =
-		Array4::<f32>::zeros((1, out_channels as usize, out_h as usize, out_w as usize));
-	let mut weight_map = Array2::<f32>::zeros((out_h as usize, out_w as usize));
+	let mut canvas: Option<Array4<f32>> = None;
+	let mut weight_map: Option<Array2<f32>> = None;
+	let mut actual_scale = model_info.scale;
 
 	for (idx, tile) in tiles.iter().enumerate() {
-		// Check cancellation between tiles.
 		if options.cancel.is_cancelled() {
 			bail!("Cancelled");
 		}
 
-		let tile_output = run_tile(ctx, input, tile, &model_info)?;
+		let (tile_output, tile_scale) = run_tile(ctx, input, tile, &model_info)?;
 
-		// Blend tile into canvas.
-		let scaled_overlap = options.tile_overlap * scale;
+		if canvas.is_none() {
+			actual_scale = tile_scale;
+			let out_channels = tile_output.shape()[1];
+			let out_w = img_w * actual_scale;
+			let out_h = img_h * actual_scale;
+			canvas = Some(Array4::<f32>::zeros((
+				1,
+				out_channels,
+				out_h as usize,
+				out_w as usize,
+			)));
+			weight_map = Some(Array2::<f32>::zeros((out_h as usize, out_w as usize)));
+		}
+
+		// Both are initialised on the first iteration above.
+		let canvas = canvas.as_mut().unwrap();
+		let weight_map = weight_map.as_mut().unwrap();
+
+		let actual_dst_x = tile.src.x * actual_scale;
+		let actual_dst_y = tile.src.y * actual_scale;
+		let scaled_overlap = options.tile_overlap * actual_scale;
+
 		accumulate_tile(
-			&mut canvas,
-			&mut weight_map,
+			canvas,
+			weight_map,
 			&tile_output,
-			tile,
+			actual_dst_x,
+			actual_dst_y,
 			scaled_overlap,
 		);
 
@@ -142,12 +148,27 @@ pub fn upscale_image(
 		}
 	}
 
-	// Normalise canvas by accumulated weights.
+	let (mut canvas, weight_map) = canvas
+		.zip(weight_map)
+		.ok_or_else(|| anyhow::anyhow!("No tiles were processed"))?;
+	let out_channels = canvas.shape()[1] as u32;
+
 	normalise_canvas(&mut canvas, &weight_map);
 
-	let ai_result = tensor_to_image(canvas.view(), out_channels)?;
+	tensor_to_image(canvas.view(), out_channels)
+}
 
-	// Apply frequency-domain blending if requested.
+/// Upscale a single image with optional frequency-domain blending.
+///
+/// Convenience wrapper around [`upscale_raw`] that also applies blending
+/// when `options.blend > 0.0`.
+pub fn upscale_image(
+	ctx: &mut SessionContext,
+	input: &DynamicImage,
+	options: &UpscaleOptions,
+) -> Result<DynamicImage> {
+	let ai_result = upscale_raw(ctx, input, options)?;
+
 	if options.blend > 0.0 {
 		let blend_cb = options
 			.on_blend_step
@@ -160,15 +181,18 @@ pub fn upscale_image(
 }
 
 /// Run inference on a single tile.
+///
+/// Returns the cropped output tensor together with the scale factor the model
+/// actually applied (derived from the ratio of output to input spatial dims).
+/// This may differ from `model_info.scale` when static scale detection fails
+/// (e.g. Resize-based upscalers that have no `DepthToSpace` or `ConvTranspose`).
 fn run_tile(
 	ctx: &mut SessionContext,
 	input: &DynamicImage,
 	tile: &Tile,
 	model_info: &ModelInfo,
-) -> Result<Array4<f32>> {
+) -> Result<(Array4<f32>, u32)> {
 	let in_channels = model_info.input_channels;
-	let out_channels = model_info.output_channels as usize;
-	let scale = model_info.scale as usize;
 
 	// Crop the source region from the input image.
 	let cropped = input.crop_imm(tile.src.x, tile.src.y, tile.src.width, tile.src.height);
@@ -181,13 +205,11 @@ fn run_tile(
 		tensor = pad_tensor_mirror(&tensor, tile.padding);
 	}
 
-	// Compute expected output shape (input spatial dims × scale).
+	// Record padded input height to derive the actual scale after inference.
 	let in_h = tensor.shape()[2];
-	let in_w = tensor.shape()[3];
-	let expected_shape = (1, out_channels, in_h * scale, in_w * scale);
 
-	// Run inference.
-	let output_tensor = if model_info.needs_fp16_input() {
+	// Run inference — output shape is determined by the model, not by us.
+	let raw_output = if model_info.needs_fp16_input() {
 		let f16_tensor = tensor_f32_to_f16(&tensor);
 		let input_value = ort::value::Value::from_array(f16_tensor)
 			.map_err(|e| anyhow::anyhow!("Failed to create ORT value from fp16 tensor: {e}"))?;
@@ -195,7 +217,7 @@ fn run_tile(
 			.session
 			.run(ort::inputs![input_value])
 			.map_err(|e| anyhow::anyhow!("Inference failed: {e}"))?;
-		extract_output_f32(&outputs, expected_shape)?
+		extract_output_f32(&outputs)?
 	} else {
 		let input_value = ort::value::Value::from_array(tensor)
 			.map_err(|e| anyhow::anyhow!("Failed to create ORT value from f32 tensor: {e}"))?;
@@ -203,41 +225,82 @@ fn run_tile(
 			.session
 			.run(ort::inputs![input_value])
 			.map_err(|e| anyhow::anyhow!("Inference failed: {e}"))?;
-		extract_output_f32(&outputs, expected_shape)?
+		extract_output_f32(&outputs)?
 	};
 
-	// Remove padding from output (scale-adjusted).
-	Ok(crop_tensor(
-		output_tensor.view(),
-		tile.padding,
-		model_info.scale,
-	))
+	// Derive the actual scale from the ratio of output to (padded) input height.
+	// Use 1 as the minimum so restoration-only models (scale = 1) still work.
+	let actual_scale = (raw_output.shape()[2] / in_h).max(1) as u32;
+
+	// Remove padding from output using the *actual* scale, not the declared one.
+	let tile_output = crop_tensor(raw_output.view(), tile.padding, actual_scale);
+
+	Ok((tile_output, actual_scale))
 }
 
-/// Extract the output tensor as f32, handling both f32 and f16 outputs.
-fn extract_output_f32(
-	outputs: &ort::session::SessionOutputs<'_>,
-	expected_shape: (usize, usize, usize, usize),
-) -> Result<Array4<f32>> {
+/// Extract the first output tensor as an NCHW f32 `Array4`.
+///
+/// The actual shape reported by ORT is used to build the array, so this
+/// works even when the statically detected scale is wrong.  Both f32 and
+/// f16 model outputs are handled.  4-D NHWC layouts (last dim ≤ 4, second
+/// dim > 4) are transposed to NCHW automatically; 3-D CHW tensors have a
+/// batch dimension prepended.
+fn extract_output_f32(outputs: &ort::session::SessionOutputs<'_>) -> Result<Array4<f32>> {
 	let (_, output) = outputs
 		.iter()
 		.next()
 		.ok_or_else(|| anyhow::anyhow!("Model produced no outputs"))?;
 
 	// Try f32 first.
-	if let Ok((_shape, data)) = output.try_extract_tensor::<f32>() {
-		return Array4::from_shape_vec(expected_shape, data.to_vec())
-			.map_err(|e| anyhow::anyhow!("Failed to reshape f32 output: {e}"));
+	if let Ok((shape, data)) = output.try_extract_tensor::<f32>() {
+		// `**shape` derefs to &[i64]; convert to Vec<usize> for ndarray.
+		let dims: Vec<usize> = (**shape).iter().map(|&d| d as usize).collect();
+		return coerce_to_nchw(data.to_vec(), &dims);
 	}
 
 	// Try f16.
-	if let Ok((_shape, data)) = output.try_extract_tensor::<half::f16>() {
-		let f32_data: Vec<f32> = data.iter().map(|v| half::f16::to_f32(*v)).collect();
-		return Array4::from_shape_vec(expected_shape, f32_data)
-			.map_err(|e| anyhow::anyhow!("Failed to reshape f16 output: {e}"));
+	if let Ok((shape, data)) = output.try_extract_tensor::<half::f16>() {
+		let dims: Vec<usize> = (**shape).iter().map(|&d| d as usize).collect();
+		let f32_data: Vec<f32> = data.iter().map(|v| v.to_f32()).collect();
+		return coerce_to_nchw(f32_data, &dims);
 	}
 
 	bail!("Unsupported output tensor dtype (expected float32 or float16)")
+}
+
+/// Reshape a flat data buffer into an NCHW `Array4<f32>`.
+///
+/// Handles:
+/// - 4-D NCHW `[N, C, H, W]` — used as-is.
+/// - 4-D NHWC `[N, H, W, C]` — detected when the last dim is ≤ 4 and the
+///   second dim is > 4, then transposed to `[N, C, H, W]`.
+/// - 3-D CHW `[C, H, W]` — a batch dimension of 1 is prepended.
+fn coerce_to_nchw(data: Vec<f32>, dims: &[usize]) -> Result<Array4<f32>> {
+	match dims {
+		[d0, d1, d2, d3] => {
+			// Heuristic: if the last dim is a plausible channel count (≤ 4) and
+			// the second dim is clearly spatial (> 4), the layout is NHWC.
+			if *d3 <= 4 && *d1 > 4 {
+				let nhwc = Array4::from_shape_vec((*d0, *d1, *d2, *d3), data)
+					.map_err(|e| anyhow::anyhow!("Failed to create NHWC tensor: {e}"))?;
+				// Permute [N, H, W, C] → [N, C, H, W]
+				Ok(nhwc.permuted_axes([0, 3, 1, 2]).into_owned())
+			} else {
+				Array4::from_shape_vec((*d0, *d1, *d2, *d3), data)
+					.map_err(|e| anyhow::anyhow!("Failed to create NCHW tensor: {e}"))
+			}
+		}
+		[c, h, w] => {
+			// 3-D CHW — add batch dimension.
+			Array4::from_shape_vec((1, *c, *h, *w), data)
+				.map_err(|e| anyhow::anyhow!("Failed to create CHW tensor: {e}"))
+		}
+		_ => bail!(
+			"Unsupported output tensor rank {} (expected 3-D or 4-D, shape: {:?})",
+			dims.len(),
+			dims
+		),
+	}
 }
 
 /// Accumulate a tile's output into the canvas with Hann-window blending.
@@ -245,7 +308,8 @@ fn accumulate_tile(
 	canvas: &mut Array4<f32>,
 	weight_map: &mut Array2<f32>,
 	tile_output: &Array4<f32>,
-	tile: &Tile,
+	dst_x: u32,
+	dst_y: u32,
 	scaled_overlap: u32,
 ) {
 	let tile_h = tile_output.shape()[2] as u32;
@@ -254,8 +318,8 @@ fn accumulate_tile(
 
 	let weights = blend_weights(tile_w, tile_h, scaled_overlap);
 
-	let dst_y = tile.dst.y as usize;
-	let dst_x = tile.dst.x as usize;
+	let dst_y = dst_y as usize;
+	let dst_x = dst_x as usize;
 
 	for y in 0..tile_h as usize {
 		for x in 0..tile_w as usize {

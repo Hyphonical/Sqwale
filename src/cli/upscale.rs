@@ -6,7 +6,7 @@ use indicatif::{MultiProgress, ProgressBar};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use sqwale::imageio;
 use sqwale::pipeline::{CancelToken, UpscaleOptions};
@@ -115,7 +115,7 @@ pub fn run(
 		run_single(
 			&inputs[0],
 			output_arg,
-			&mut ctx,
+			ctx,
 			scale,
 			&model_filename,
 			tile_size,
@@ -132,7 +132,7 @@ pub fn run(
 fn run_single(
 	input: &Path,
 	output_arg: Option<&str>,
-	ctx: &mut sqwale::SessionContext,
+	mut ctx: sqwale::SessionContext,
 	scale: u32,
 	model_filename: &str,
 	tile_size: u32,
@@ -198,11 +198,10 @@ fn run_single(
 	};
 
 	let pb_clone = pb.clone();
-	let pb_blend_clone = pb.clone();
 	let options = UpscaleOptions {
 		tile_size,
 		tile_overlap,
-		blend,
+		blend: 0.0,
 		cancel: cancel.clone(),
 		on_tile_done: Some(Box::new(move |done, total| {
 			if let Some(ref pb) = pb_clone {
@@ -223,31 +222,51 @@ fn run_single(
 				));
 			}
 		})),
-		on_blend_step: if show_progress && blend > 0.0 {
-			Some(Box::new(move |done, total| {
-				if let Some(ref pb) = pb_blend_clone {
-					pb.set_length(total as u64);
-					pb.set_position(done as u64);
-					pb.set_message(format!(
-						"{}/{} Blending…  {}",
-						done.to_string().bold().bright_white(),
-						total,
-						format_duration(start.elapsed()).dimmed(),
-					));
-				}
-			}))
-		} else {
-			None
-		},
+		on_blend_step: None,
 	};
 
-	let result = sqwale::pipeline::upscale_image(ctx, &img, &options);
+	let result = sqwale::pipeline::upscale_raw(&mut ctx, &img, &options);
 
 	if let Some(ref pb) = pb {
 		pb.finish_and_clear();
 	}
 
-	let output_img = result?;
+	// Free the model session to reclaim GPU memory before blending and saving.
+	drop(ctx);
+
+	let ai_img = result?;
+
+	// Apply frequency-domain blending if requested.
+	let output_img = if blend > 0.0 {
+		let pb = if show_progress {
+			let pb = ProgressBar::new(0).with_style(tile_bar_style());
+			pb.enable_steady_tick(Duration::from_millis(SPINNER_TICK_MS));
+			Some(pb)
+		} else {
+			None
+		};
+		let pb_clone = pb.clone();
+		let on_step = move |done: usize, total: usize| {
+			if let Some(ref pb) = pb_clone {
+				pb.set_length(total as u64);
+				pb.set_position(done as u64);
+				pb.set_message(format!(
+					"{}/{} Blending…  {}",
+					done.to_string().bold().bright_white(),
+					total,
+					format_duration(start.elapsed()).dimmed(),
+				));
+			}
+		};
+		let blended = sqwale::frequency_blend_with_original(&ai_img, &img, blend, Some(&on_step))?;
+		if let Some(ref pb) = pb {
+			pb.finish_and_clear();
+		}
+		blended
+	} else {
+		ai_img
+	};
+
 	let elapsed = start.elapsed();
 
 	let (out_w, out_h) = (output_img.width(), output_img.height());
@@ -731,5 +750,3 @@ fn resolve_batch_output(input: &Path, output_dir: Option<&Path>, scale: u32) -> 
 		}
 	}
 }
-
-use std::time::Duration;

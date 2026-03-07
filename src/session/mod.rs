@@ -31,8 +31,7 @@ pub struct SessionContext {
 /// 3. Returns the session context with metadata and actual provider.
 pub fn load_model(path: &Path, provider: ProviderSelection) -> Result<SessionContext> {
 	let model_info = inspect::inspect_model(path)?;
-
-	let (session, provider_used) = create_session(path, provider)?;
+	let (session, provider_used) = create_session(provider, |b| b.commit_from_file(path))?;
 
 	Ok(SessionContext {
 		session,
@@ -47,8 +46,7 @@ pub fn load_model(path: &Path, provider: ProviderSelection) -> Result<SessionCon
 /// Useful for embedded models included via `include_bytes!`.
 pub fn load_model_bytes(bytes: &[u8], provider: ProviderSelection) -> Result<SessionContext> {
 	let model_info = inspect::inspect_model_bytes(bytes)?;
-
-	let (session, provider_used) = create_session_from_bytes(bytes, provider)?;
+	let (session, provider_used) = create_session(provider, |b| b.commit_from_memory(bytes))?;
 
 	Ok(SessionContext {
 		session,
@@ -58,28 +56,32 @@ pub fn load_model_bytes(bytes: &[u8], provider: ProviderSelection) -> Result<Ses
 }
 
 /// Create an ORT session with the given provider, falling back to CPU on failure.
+///
+/// The `commit` closure finalises a configured session builder into a session.
+/// It receives the builder by mutable reference and calls the appropriate
+/// `commit_from_file` or `commit_from_memory` method.
 fn create_session(
-	path: &Path,
 	provider: ProviderSelection,
+	commit: impl Fn(&mut ort::session::builder::SessionBuilder) -> ort::Result<Session>,
 ) -> Result<(Session, ProviderSelection)> {
 	match provider {
 		ProviderSelection::Auto => {
-			let session = Session::builder()
+			let mut builder = Session::builder()
 				.map_err(|e| anyhow::anyhow!("Failed to create session builder: {e}"))?
 				.with_auto_device(AutoDevicePolicy::MaxPerformance)
-				.map_err(|e| anyhow::anyhow!("Failed to configure auto device: {e}"))?
-				.commit_from_file(path)
-				.map_err(|e| anyhow::anyhow!("Failed to load model: {}: {e}", path.display()))?;
+				.map_err(|e| anyhow::anyhow!("Failed to configure auto device: {e}"))?;
+			let session =
+				commit(&mut builder).map_err(|e| anyhow::anyhow!("Failed to load model: {e}"))?;
 			Ok((session, ProviderSelection::Auto))
 		}
 		ProviderSelection::Cpu => {
 			let ep = make_ep(ProviderSelection::Cpu)?;
-			let session = Session::builder()
+			let mut builder = Session::builder()
 				.map_err(|e| anyhow::anyhow!("Failed to create session builder: {e}"))?
 				.with_execution_providers([ep])
-				.map_err(|e| anyhow::anyhow!("Failed to configure CPU provider: {e}"))?
-				.commit_from_file(path)
-				.map_err(|e| anyhow::anyhow!("Failed to load model: {}: {e}", path.display()))?;
+				.map_err(|e| anyhow::anyhow!("Failed to configure CPU provider: {e}"))?;
+			let session =
+				commit(&mut builder).map_err(|e| anyhow::anyhow!("Failed to load model: {e}"))?;
 			Ok((session, ProviderSelection::Cpu))
 		}
 		requested => {
@@ -88,7 +90,7 @@ fn create_session(
 			let try_result = Session::builder()
 				.map_err(|e| e.to_string())
 				.and_then(|b| b.with_execution_providers([ep]).map_err(|e| e.to_string()))
-				.and_then(|mut b| b.commit_from_file(path).map_err(|e| e.to_string()));
+				.and_then(|mut b| commit(&mut b).map_err(|e| e.to_string()));
 
 			match try_result {
 				Ok(session) => Ok((session, requested)),
@@ -99,76 +101,13 @@ fn create_session(
 						e
 					);
 					let ep = make_ep(ProviderSelection::Cpu)?;
-					let session = Session::builder()
+					let mut builder = Session::builder()
 						.map_err(|e| anyhow::anyhow!("Failed to create session builder: {e}"))?
 						.with_execution_providers([ep])
-						.map_err(|e| anyhow::anyhow!("Failed to configure CPU fallback: {e}"))?
-						.commit_from_file(path)
-						.map_err(|e| {
-							anyhow::anyhow!(
-								"Failed to load model with CPU fallback: {}: {e}",
-								path.display()
-							)
-						})?;
-					Ok((session, ProviderSelection::Cpu))
-				}
-			}
-		}
-	}
-}
-
-/// Create an ORT session from raw model bytes with the given provider.
-fn create_session_from_bytes(
-	bytes: &[u8],
-	provider: ProviderSelection,
-) -> Result<(Session, ProviderSelection)> {
-	match provider {
-		ProviderSelection::Auto => {
-			let session = Session::builder()
-				.map_err(|e| anyhow::anyhow!("Failed to create session builder: {e}"))?
-				.with_auto_device(AutoDevicePolicy::MaxPerformance)
-				.map_err(|e| anyhow::anyhow!("Failed to configure auto device: {e}"))?
-				.commit_from_memory(bytes)
-				.map_err(|e| anyhow::anyhow!("Failed to load model from memory: {e}"))?;
-			Ok((session, ProviderSelection::Auto))
-		}
-		ProviderSelection::Cpu => {
-			let ep = make_ep(ProviderSelection::Cpu)?;
-			let session = Session::builder()
-				.map_err(|e| anyhow::anyhow!("Failed to create session builder: {e}"))?
-				.with_execution_providers([ep])
-				.map_err(|e| anyhow::anyhow!("Failed to configure CPU provider: {e}"))?
-				.commit_from_memory(bytes)
-				.map_err(|e| anyhow::anyhow!("Failed to load model from memory: {e}"))?;
-			Ok((session, ProviderSelection::Cpu))
-		}
-		requested => {
-			// Try the requested provider, fall back to CPU on failure.
-			let ep = make_ep(requested)?;
-			let try_result = Session::builder()
-				.map_err(|e| e.to_string())
-				.and_then(|b| b.with_execution_providers([ep]).map_err(|e| e.to_string()))
-				.and_then(|mut b| b.commit_from_memory(bytes).map_err(|e| e.to_string()));
-
-			match try_result {
-				Ok(session) => Ok((session, requested)),
-				Err(e) => {
-					warn!(
-						"{} provider failed ({}), falling back to CPU",
-						requested.name(),
-						e
-					);
-					let ep = make_ep(ProviderSelection::Cpu)?;
-					let session = Session::builder()
-						.map_err(|e| anyhow::anyhow!("Failed to create session builder: {e}"))?
-						.with_execution_providers([ep])
-						.map_err(|e| anyhow::anyhow!("Failed to configure CPU fallback: {e}"))?
-						.commit_from_memory(bytes)
-						.map_err(|e| {
-							anyhow::anyhow!(
-								"Failed to load model from memory with CPU fallback: {e}"
-							)
-						})?;
+						.map_err(|e| anyhow::anyhow!("Failed to configure CPU fallback: {e}"))?;
+					let session = commit(&mut builder).map_err(|e| {
+						anyhow::anyhow!("Failed to load model with CPU fallback: {e}")
+					})?;
 					Ok((session, ProviderSelection::Cpu))
 				}
 			}

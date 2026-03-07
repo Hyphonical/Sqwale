@@ -22,13 +22,20 @@ pub fn inspect_model_bytes(file_bytes: &[u8]) -> Result<ModelInfo> {
 	let nodes = proto::extract_nodes(file_bytes);
 	let opset = proto::extract_opset(file_bytes);
 	let metadata = proto::extract_metadata(file_bytes);
+	let float_inits = proto::extract_float_initializers(file_bytes);
 	let (input_io, output_io) = proto::extract_io_from_proto(file_bytes);
 
 	let (input_channels, input_spatial, input_dtype) = parse_io(input_io)?;
 	let (output_channels, output_spatial, output_dtype) =
 		parse_io(output_io).unwrap_or_else(|_| (input_channels, (None, None), input_dtype.clone()));
 
-	let (scale, scale_source) = detect_scale(&nodes, &metadata, input_spatial, output_spatial);
+	let (scale, scale_source) = detect_scale(
+		&nodes,
+		&metadata,
+		&float_inits,
+		input_spatial,
+		output_spatial,
+	);
 	let tile = detect_tiling(&nodes, input_spatial);
 	let color_space = infer_color_space(input_channels);
 	let op_fingerprint = compute_op_fingerprint(&nodes);
@@ -64,6 +71,7 @@ fn infer_color_space(channels: u32) -> ColorSpace {
 fn detect_scale(
 	nodes: &[NodeInfo],
 	metadata: &HashMap<String, String>,
+	float_inits: &HashMap<String, Vec<f32>>,
 	input_spatial: (Option<u64>, Option<u64>),
 	output_spatial: (Option<u64>, Option<u64>),
 ) -> (u32, ScaleSource) {
@@ -82,24 +90,65 @@ fn detect_scale(
 		}
 	}
 
+	let mut resize_product: u32 = 1;
 	for node in nodes {
-		if node.op_type == "DepthToSpace" {
-			if let Some((_, scale)) = node.int_attrs.iter().find(|(name, _)| name == "blocksize") {
-				return (*scale as u32, ScaleSource::DepthToSpace);
+		match node.op_type.as_str() {
+			"DepthToSpace" => {
+				if let Some((_, scale)) =
+					node.int_attrs.iter().find(|(name, _)| name == "blocksize")
+				{
+					return (*scale as u32, ScaleSource::DepthToSpace);
+				}
 			}
-		}
-		if node.op_type == "ConvTranspose" {
-			if let Some((_, strides)) = node.ints_attrs.iter().find(|(name, _)| name == "strides") {
-				if let Some(&stride) = strides.iter().max() {
-					if stride > 1 {
-						return (stride as u32, ScaleSource::ConvTransposeStride);
+			"ConvTranspose" => {
+				if let Some((_, strides)) =
+					node.ints_attrs.iter().find(|(name, _)| name == "strides")
+				{
+					if let Some(&stride) = strides.iter().max() {
+						if stride > 1 {
+							return (stride as u32, ScaleSource::ConvTransposeStride);
+						}
 					}
 				}
 			}
+			// Resize op: input[2] = scales tensor (optional), input[3] = sizes tensor.
+			// Models sometimes chain multiple Resize nodes (e.g. two 2x nodes for 4x total).
+			// Accumulate the product so we report the overall upscale factor.
+			"Resize" => {
+				if let Some(scale) = detect_resize_scale(node, float_inits) {
+					resize_product = resize_product.saturating_mul(scale);
+				}
+			}
+			_ => {}
 		}
 	}
 
+	if resize_product > 1 {
+		return (resize_product, ScaleSource::Resize);
+	}
+
 	(1, ScaleSource::Assumed)
+}
+
+/// Try to read the spatial scale from a Resize node's scales initializer.
+///
+/// Returns `Some(scale)` when the node's scales input (index 2) resolves to a
+/// float tensor that contains at least one whole-number spatial scale ≥ 2.
+/// The maximum value in the tensor is used, so vectors of any length work:
+/// `[1, 1, 4, 4]`, `[4, 4]`, or `[1, 4, 4]` all yield `Some(4)`.
+fn detect_resize_scale(node: &NodeInfo, float_inits: &HashMap<String, Vec<f32>>) -> Option<u32> {
+	// inputs: [data, roi, scales, sizes] — scales is index 2.
+	let scales_name = node.inputs.get(2).filter(|s| !s.is_empty())?;
+	let scales = float_inits.get(scales_name.as_str())?;
+	if scales.is_empty() {
+		return None;
+	}
+	// The spatial scale is the maximum value; batch/channel scales are 1.0.
+	let max_scale = scales.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+	if max_scale < 2.0 || max_scale.fract() != 0.0 {
+		return None;
+	}
+	Some(max_scale as u32)
 }
 
 fn detect_tiling(nodes: &[NodeInfo], input_spatial: (Option<u64>, Option<u64>)) -> TileInfo {
