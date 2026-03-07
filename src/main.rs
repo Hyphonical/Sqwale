@@ -34,6 +34,22 @@ fn main() -> Result<()> {
 		} => {
 			cli::upscale::run(input, model.as_deref(), output.as_deref(), &args)?;
 		}
+		cli::Commands::Interpolate {
+			input,
+			output,
+			multiplier,
+			crf,
+			ensemble,
+		} => {
+			cli::interpolate::run(
+				input,
+				output.as_deref(),
+				*multiplier,
+				*crf,
+				*ensemble,
+				&args,
+			)?;
+		}
 	}
 
 	Ok(())

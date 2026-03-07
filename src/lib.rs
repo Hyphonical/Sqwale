@@ -6,12 +6,14 @@
 // 4xLSDIRCompactv2 — https://openmodeldb.info/models/4x-LSDIRCompact-v2
 // License: CC-BY-4.0  (https://creativecommons.org/licenses/by/4.0/)
 // Author: Phhofm — https://github.com/Phhofm
-pub const DEFAULT_MODEL_BYTES: &[u8] = include_bytes!("../4xLSDIRCompactv2.onnx");
+pub const DEFAULT_MODEL_BYTES: &[u8] = include_bytes!("../models/4xLSDIRCompactv2.onnx");
 
 // ── Public modules ──────────────────────────────────────────────────────────
 pub mod config;
+pub mod ffmpeg;
 pub mod imageio;
 pub mod inspect;
+pub mod interpolate;
 pub mod pipeline;
 pub mod session;
 

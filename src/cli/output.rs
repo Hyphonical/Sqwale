@@ -82,6 +82,17 @@ pub fn batch_bar_style() -> ProgressStyle {
 		.progress_chars("━╌")
 }
 
+/// Interpolation progress bar style with built-in ETA.
+pub fn interp_bar_style() -> ProgressStyle {
+	ProgressStyle::default_bar()
+		.tick_strings(SPINNER_FRAMES)
+		.template(
+			"  {spinner:.cyan} {bar:40.cyan/238}  {pos}/{len} frames · {elapsed_precise} · ~{eta} left",
+		)
+		.unwrap()
+		.progress_chars("━╌")
+}
+
 /// Run a closure while displaying a spinner on stderr.
 pub fn with_spinner<T>(label: &str, f: impl FnOnce() -> T) -> T {
 	if !should_show_progress() {

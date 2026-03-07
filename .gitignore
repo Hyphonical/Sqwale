@@ -21,7 +21,7 @@ target
 #.idea/
 
 # Models
-models/*.onnx
+.models/*.onnx
 
 # Images
 *.jpg

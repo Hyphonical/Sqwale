@@ -1,6 +1,7 @@
 //! CLI argument definitions and command dispatch.
 
 pub mod inspect;
+pub mod interpolate;
 pub mod output;
 pub mod upscale;
 
@@ -66,5 +67,28 @@ pub enum Commands {
 		/// Omit to write next to the input as `{stem}_{scale}x.{ext}`.
 		#[arg(short, long)]
 		output: Option<String>,
+	},
+
+	/// Interpolate video frames using RIFE 4.25 (requires FFmpeg).
+	Interpolate {
+		/// Input video file path.
+		input: String,
+
+		/// Output video file path (always .mkv).
+		/// Omit to write next to the input as `{stem}_{multiplier}x.mkv`.
+		#[arg(short, long)]
+		output: Option<String>,
+
+		/// Frame rate multiplier (must be a power of two: 2, 4, 8, …).
+		#[arg(short = 'x', long, default_value_t = 2)]
+		multiplier: u32,
+
+		/// x264 CRF quality value (lower = better quality, larger file).
+		#[arg(long, default_value_t = 18)]
+		crf: u32,
+
+		/// Use ensemble mode (horizontal-flip averaging) for higher quality.
+		#[arg(long)]
+		ensemble: bool,
 	},
 }
