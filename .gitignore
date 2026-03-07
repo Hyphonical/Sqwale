@@ -31,3 +31,11 @@ target
 *.gif
 *.tiff
 *.webp
+
+# Videos
+*.mp4
+*.avi
+*.mkv
+*.mov
+*.flv
+*.wmv
