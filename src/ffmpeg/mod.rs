@@ -222,9 +222,24 @@ pub fn spawn_writer(
 		.args(["-map", "0:v"])
 		.args(["-map", "1:a?"]);
 
+	// ALWAYS force a standard output pixel format so players can read the file!
+	// (Note: This is applied to the output stream, not the raw input stream)
+	cmd.args(["-pix_fmt", "yuv420p"]);
+
 	if supports_nvenc() {
 		info!("Hardware encoding: using hevc_nvenc (preset p4)");
 		cmd.args(["-c:v", "hevc_nvenc"]).args(["-preset", "p4"]);
+
+		if crf == 0 {
+			// NVENC requires a specific tune flag for true lossless
+			cmd.args(["-tune", "lossless"]);
+		} else {
+			// For standard NVENC, you must specify VBR rate control and remove bitrate limits
+			// for the -cq flag to actually be respected.
+			cmd.args(["-rc", "vbr"])
+				.args(["-cq", &crf.to_string()])
+				.args(["-b:v", "0"]);
+		}
 	} else {
 		info!("Hardware encoding unavailable: falling back to libx264 (preset fast)");
 		cmd.args(["-c:v", "libx264"])

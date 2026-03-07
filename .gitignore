@@ -23,6 +23,9 @@ target
 # Models
 .models/*.onnx
 
+# Binaries
+*.exe
+
 # Images
 *.jpg
 *.jpeg
