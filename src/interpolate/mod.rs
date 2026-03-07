@@ -7,9 +7,11 @@
 pub mod rife;
 
 use anyhow::{Result, bail};
+use crossbeam_channel::bounded;
 use ndarray::Array4;
-use std::io::Write;
+use std::io::{BufReader, BufWriter, Write};
 use std::path::Path;
+use std::thread;
 use tracing::{debug, info};
 
 use crate::ffmpeg;
@@ -76,8 +78,8 @@ pub fn run(
 	);
 
 	// Spawn FFmpeg processes.
-	let (mut reader_child, mut reader_stdout) = ffmpeg::spawn_reader(input)?;
-	let (mut writer_child, mut writer_stdin) = ffmpeg::spawn_writer(
+	let (mut reader_child, reader_stdout) = ffmpeg::spawn_reader(input)?;
+	let (mut writer_child, writer_stdin) = ffmpeg::spawn_writer(
 		input,
 		output,
 		info.width,
@@ -86,96 +88,173 @@ pub fn run(
 		options.crf,
 	)?;
 
-	// Pre-allocate frame buffers.
-	let mut buf_a = vec![0u8; frame_size];
-	let mut buf_b = vec![0u8; frame_size];
+	// Bounded channels decouple FFmpeg I/O from inference.
+	// Reader → Inference: up to 10 raw frames buffered.
+	let (read_tx, read_rx) = bounded::<Vec<u8>>(10);
+	// Inference → Writer: up to 20 output frames buffered.
+	let (write_tx, write_rx) = bounded::<Vec<u8>>(20);
 
-	// Read the first frame.
-	if !ffmpeg::read_frame(&mut reader_stdout, &mut buf_a)? {
-		// Close pipes and wait for child processes.
-		drop(writer_stdin);
-		let _ = reader_child.wait();
-		let _ = writer_child.wait();
-		bail!("Video contains no frames");
-	}
+	// Reader thread: continuously reads raw RGB24 frames from FFmpeg stdout
+	// and forwards them into the inference channel.
+	let reader_handle = thread::spawn(move || -> Result<()> {
+		let mut reader = BufReader::new(reader_stdout);
+		loop {
+			let mut frame = vec![0u8; frame_size];
+			match ffmpeg::read_frame(&mut reader, &mut frame) {
+				Ok(true) => {
+					if read_tx.send(frame).is_err() {
+						// Inference thread dropped the receiver; stop reading.
+						break;
+					}
+				}
+				Ok(false) => break, // Clean EOF.
+				Err(e) => return Err(e),
+			}
+		}
+		Ok(())
+	});
 
-	let mut tensor_a = rife::bytes_to_tensor(&buf_a, info.width, info.height);
+	// Writer thread: receives output frames from the inference channel and
+	// writes them sequentially to FFmpeg stdin.
+	let writer_handle = thread::spawn(move || -> Result<()> {
+		let mut writer = BufWriter::new(writer_stdin);
+		for frame in write_rx {
+			writer
+				.write_all(&frame)
+				.map_err(|e| anyhow::anyhow!("Failed to write frame to FFmpeg: {e}"))?;
+		}
+		writer
+			.flush()
+			.map_err(|e| anyhow::anyhow!("Failed to flush FFmpeg writer: {e}"))
+	});
+
+	// ── Inference (Main Thread) ────────────────────────────────────────────
+	// Inference is strictly sequential to preserve frame order; only I/O is
+	// decoupled into the reader/writer threads above.
+
 	let mut frames_written: usize = 0;
-	let mut frames_read: usize = 1;
+	let mut frames_read: usize = 0;
+	let mut inference_result: Result<()> = Ok(());
 
-	// Write the first frame as-is.
-	write_bytes(&mut writer_stdin, &buf_a)?;
-	frames_written += 1;
-	report_progress(&options.on_progress, frames_written, total_output_frames);
+	// Receive the first frame; if none arrives the input is empty.
+	if let Ok(buf_a) = read_rx.recv() {
+		let mut tensor_a = rife::bytes_to_tensor(&buf_a, info.width, info.height);
+		frames_read = 1;
 
-	// Main loop: read subsequent frames, interpolate, write.
-	loop {
-		if options.cancel.is_cancelled() {
-			info!("Interpolation cancelled — finalising output");
-			break;
-		}
+		// Log padding info once (it's constant for all frames).
+		let pad_h = (32 - (info.height % 32)) % 32;
+		let pad_w = (32 - (info.width % 32)) % 32;
+		debug!(
+			"RIFE padding: {}×{} → {}×{} (pad_h={}, pad_w={})",
+			info.width,
+			info.height,
+			info.width + pad_w,
+			info.height + pad_h,
+			pad_h,
+			pad_w
+		);
 
-		if !ffmpeg::read_frame(&mut reader_stdout, &mut buf_b)? {
-			break; // No more input frames.
-		}
-		frames_read += 1;
-
-		let tensor_b = rife::bytes_to_tensor(&buf_b, info.width, info.height);
-
-		// Generate intermediate frames recursively for the given multiplier.
-		let mids = generate_midframes(
-			rife,
-			&tensor_a,
-			&tensor_b,
-			options.multiplier,
-			options.ensemble,
-		)?;
-
-		// Write all intermediate frames.
-		for mid in &mids {
-			let bytes = rife::tensor_to_bytes(mid, info.width, info.height);
-			write_bytes(&mut writer_stdin, &bytes)?;
+		// Pass the first frame through to the writer unchanged.
+		if write_tx.send(buf_a).is_ok() {
 			frames_written += 1;
 			report_progress(&options.on_progress, frames_written, total_output_frames);
+		} else {
+			inference_result = Err(anyhow::anyhow!("Writer channel closed unexpectedly"));
 		}
 
-		// Write frame B.
-		write_bytes(&mut writer_stdin, &buf_b)?;
-		frames_written += 1;
-		report_progress(&options.on_progress, frames_written, total_output_frames);
+		// Main inference loop: receive frame B, interpolate A→B, send midframes + B.
+		'outer: while inference_result.is_ok() {
+			if options.cancel.is_cancelled() {
+				info!("Interpolation cancelled — finalising output");
+				break;
+			}
 
-		// Slide window: B becomes the new A.
-		tensor_a = tensor_b;
-		std::mem::swap(&mut buf_a, &mut buf_b);
+			let buf_b = match read_rx.recv() {
+				Ok(frame) => frame,
+				Err(_) => break, // EOF: no more input frames.
+			};
+			frames_read += 1;
+
+			let tensor_b = rife::bytes_to_tensor(&buf_b, info.width, info.height);
+
+			let mids = match generate_midframes(
+				rife,
+				&tensor_a,
+				&tensor_b,
+				options.multiplier,
+				options.ensemble,
+			) {
+				Ok(m) => m,
+				Err(e) => {
+					inference_result = Err(e);
+					break;
+				}
+			};
+
+			for mid in &mids {
+				let bytes = rife::tensor_to_bytes(mid, info.width, info.height);
+				if write_tx.send(bytes).is_err() {
+					inference_result = Err(anyhow::anyhow!("Writer channel closed unexpectedly"));
+					break 'outer;
+				}
+				frames_written += 1;
+				report_progress(&options.on_progress, frames_written, total_output_frames);
+			}
+
+			// Send frame B and slide the window.
+			if write_tx.send(buf_b).is_err() {
+				inference_result = Err(anyhow::anyhow!("Writer channel closed unexpectedly"));
+				break;
+			}
+			frames_written += 1;
+			report_progress(&options.on_progress, frames_written, total_output_frames);
+
+			tensor_a = tensor_b;
+		}
 	}
 
-	// Close writer stdin to signal EOF, then wait for FFmpeg to finalise.
-	drop(writer_stdin);
-	// Drop reader stdout so the reader process can exit cleanly.
-	drop(reader_stdout);
+	// Drop channel endpoints: signals the reader to stop sending and the
+	// writer to flush once its queue is drained.
+	drop(write_tx);
+	drop(read_rx);
 
+	// Join threads and collect any errors they encountered.
+	let reader_result = reader_handle.join().expect("reader thread panicked");
+	let writer_result = writer_handle.join().expect("writer thread panicked");
+
+	// Wait for FFmpeg processes.
 	let reader_status = reader_child.wait().ok();
-	let writer_status = writer_child
+	let writer_wait_result = writer_child
 		.wait()
-		.map_err(|e| anyhow::anyhow!("FFmpeg writer did not exit cleanly: {e}"))?;
+		.map_err(|e| anyhow::anyhow!("FFmpeg writer did not exit cleanly: {e}"));
 
-	if !writer_status.success() {
-		bail!(
-			"FFmpeg writer exited with status {}",
-			writer_status.code().unwrap_or(-1)
-		);
+	if frames_read == 0 {
+		bail!("Video contains no frames");
 	}
 
 	debug!(
 		"Reader exit: {:?}, Writer exit: {:?}",
 		reader_status.map(|s| s.code()),
-		writer_status.code()
+		writer_wait_result.as_ref().ok().and_then(|s| s.code()),
 	);
 
 	info!(
 		"Interpolation complete: {} input frames → {} output frames",
 		frames_read, frames_written
 	);
+
+	// Propagate errors in priority order: inference > reader > writer > FFmpeg exit.
+	inference_result?;
+	reader_result?;
+	writer_result?;
+
+	let writer_status = writer_wait_result?;
+	if !writer_status.success() {
+		bail!(
+			"FFmpeg writer exited with status {}",
+			writer_status.code().unwrap_or(-1)
+		);
+	}
 
 	Ok(InterpolateResult {
 		frames_written,
@@ -248,13 +327,6 @@ fn recursive_interp(
 }
 
 // ── Helpers ────────────────────────────────────────────────────────────────
-
-/// Write a complete byte buffer to the writer, handling partial writes.
-fn write_bytes(writer: &mut impl Write, data: &[u8]) -> Result<()> {
-	writer
-		.write_all(data)
-		.map_err(|e| anyhow::anyhow!("Failed to write frame to FFmpeg: {e}"))
-}
 
 /// Call the progress callback if present.
 fn report_progress(

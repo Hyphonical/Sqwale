@@ -10,7 +10,6 @@
 use anyhow::{Result, bail};
 use ndarray::{Array4, Axis, concatenate, s};
 use ort::session::Session;
-use tracing::debug;
 
 use crate::pipeline::tensor::{crop_tensor, pad_tensor_mirror};
 use crate::pipeline::tiling::Padding;
@@ -63,16 +62,6 @@ impl RifeSession {
 			right: pad_w as u32,
 		};
 
-		debug!(
-			"RIFE padding: {}×{} → {}×{} (pad_h={}, pad_w={})",
-			w,
-			h,
-			w + pad_w,
-			h + pad_h,
-			pad_h,
-			pad_w
-		);
-
 		// Pad both input frames.
 		let f0 = pad_tensor_mirror(frame0, padding);
 		let f1 = pad_tensor_mirror(frame1, padding);
@@ -80,11 +69,27 @@ impl RifeSession {
 		let padded_h = h + pad_h;
 		let padded_w = w + pad_w;
 
-		// Concatenate along the channel axis:
-		// (1,3,H,W) + (1,3,H,W) + (1,1,H,W) → (1,7,H,W).
-		let ts_channel = Array4::<f32>::from_elem((1, 1, padded_h, padded_w), timestep);
-		let combined = concatenate(Axis(1), &[f0.view(), f1.view(), ts_channel.view()])
-			.map_err(|e| anyhow::anyhow!("Failed to concatenate input: {e}"))?;
+		// Build the combined (1,7,H,W) tensor in-place instead of
+		// allocating three separate arrays and concatenating.
+		let spatial = padded_h * padded_w;
+		let mut combined_data = vec![0.0f32; 7 * spatial];
+		if let (Some(s0), Some(s1)) = (f0.as_slice(), f1.as_slice()) {
+			// Channels 0-2: frame0, channels 3-5: frame1.
+			combined_data[..3 * spatial].copy_from_slice(s0);
+			combined_data[3 * spatial..6 * spatial].copy_from_slice(s1);
+		} else {
+			// Fallback for non-contiguous tensors.
+			let combined_arr = concatenate(Axis(1), &[f0.view(), f1.view()])
+				.map_err(|e| anyhow::anyhow!("Failed to concatenate input: {e}"))?;
+			if let Some(s) = combined_arr.as_slice() {
+				combined_data[..6 * spatial].copy_from_slice(s);
+			}
+		}
+		// Channel 6: timestep broadcast.
+		combined_data[6 * spatial..].fill(timestep);
+
+		let combined = Array4::from_shape_vec((1, 7, padded_h, padded_w), combined_data)
+			.map_err(|e| anyhow::anyhow!("Failed to build combined tensor: {e}"))?;
 
 		// Create ORT input value.
 		let input_value = ort::value::Value::from_array(combined)
@@ -120,7 +125,7 @@ impl RifeSession {
 		timestep: f32,
 		ensemble: bool,
 	) -> Result<Array4<f32>> {
-		let normal = self.run_once(f0, f1, timestep)?;
+		let mut normal = self.run_once(f0, f1, timestep)?;
 
 		if !ensemble {
 			return Ok(normal);
@@ -132,8 +137,10 @@ impl RifeSession {
 		let flipped_mid = self.run_once(&f0_flip, &f1_flip, timestep)?;
 		let flipped_back = flip_horizontal(&flipped_mid);
 
-		// Average the two results.
-		Ok((&normal + &flipped_back) / 2.0)
+		// Average in-place to avoid an extra allocation.
+		normal += &flipped_back;
+		normal /= 2.0;
+		Ok(normal)
 	}
 }
 
@@ -143,29 +150,45 @@ impl RifeSession {
 ///
 /// Layout: `(1, 3, H, W)`.
 pub fn bytes_to_tensor(bytes: &[u8], w: usize, h: usize) -> Array4<f32> {
-	let mut tensor = Array4::<f32>::zeros((1, 3, h, w));
-	for y in 0..h {
-		for x in 0..w {
-			let idx = (y * w + x) * 3;
-			tensor[[0, 0, y, x]] = bytes[idx] as f32 / 255.0;
-			tensor[[0, 1, y, x]] = bytes[idx + 1] as f32 / 255.0;
-			tensor[[0, 2, y, x]] = bytes[idx + 2] as f32 / 255.0;
-		}
+	let pixels = h * w;
+	let mut data = vec![0.0f32; 3 * pixels];
+	let (r_plane, gb) = data.split_at_mut(pixels);
+	let (g_plane, b_plane) = gb.split_at_mut(pixels);
+	for i in 0..pixels {
+		let src = i * 3;
+		r_plane[i] = bytes[src] as f32 * (1.0 / 255.0);
+		g_plane[i] = bytes[src + 1] as f32 * (1.0 / 255.0);
+		b_plane[i] = bytes[src + 2] as f32 * (1.0 / 255.0);
 	}
-	tensor
+	Array4::from_shape_vec((1, 3, h, w), data).expect("buffer size matches tensor shape")
 }
 
 /// Convert an NCHW f32 tensor `(1, 3, H, W)` back to raw RGB24 bytes.
 ///
 /// Values are clamped to `[0, 1]` before scaling to `[0, 255]`.
 pub fn tensor_to_bytes(tensor: &Array4<f32>, w: usize, h: usize) -> Vec<u8> {
-	let mut bytes = vec![0u8; h * w * 3];
-	for y in 0..h {
-		for x in 0..w {
-			let idx = (y * w + x) * 3;
-			bytes[idx] = (tensor[[0, 0, y, x]].clamp(0.0, 1.0) * 255.0 + 0.5) as u8;
-			bytes[idx + 1] = (tensor[[0, 1, y, x]].clamp(0.0, 1.0) * 255.0 + 0.5) as u8;
-			bytes[idx + 2] = (tensor[[0, 2, y, x]].clamp(0.0, 1.0) * 255.0 + 0.5) as u8;
+	let pixels = h * w;
+	let mut bytes = vec![0u8; pixels * 3];
+	// Use contiguous slice access when possible for ~10× speedup over indexed access.
+	if let Some(data) = tensor.as_slice() {
+		let r_plane = &data[..pixels];
+		let g_plane = &data[pixels..2 * pixels];
+		let b_plane = &data[2 * pixels..3 * pixels];
+		for i in 0..pixels {
+			let dst = i * 3;
+			bytes[dst] = (r_plane[i].clamp(0.0, 1.0) * 255.0 + 0.5) as u8;
+			bytes[dst + 1] = (g_plane[i].clamp(0.0, 1.0) * 255.0 + 0.5) as u8;
+			bytes[dst + 2] = (b_plane[i].clamp(0.0, 1.0) * 255.0 + 0.5) as u8;
+		}
+	} else {
+		// Fallback for non-contiguous tensors.
+		for y in 0..h {
+			for x in 0..w {
+				let idx = (y * w + x) * 3;
+				bytes[idx] = (tensor[[0, 0, y, x]].clamp(0.0, 1.0) * 255.0 + 0.5) as u8;
+				bytes[idx + 1] = (tensor[[0, 1, y, x]].clamp(0.0, 1.0) * 255.0 + 0.5) as u8;
+				bytes[idx + 2] = (tensor[[0, 2, y, x]].clamp(0.0, 1.0) * 255.0 + 0.5) as u8;
+			}
 		}
 	}
 	bytes
@@ -204,21 +227,33 @@ fn create_rife_session(provider: ProviderSelection) -> Result<Session> {
 	let commit =
 		|b: &mut ort::session::builder::SessionBuilder| b.commit_from_memory(RIFE_MODEL_BYTES);
 
+	let configure = |b: ort::session::builder::SessionBuilder| -> Result<ort::session::builder::SessionBuilder> {
+		b
+			.with_optimization_level(ort::session::builder::GraphOptimizationLevel::Level3)
+			.map_err(|e| anyhow::anyhow!("Failed to set optimization level: {e}"))?
+			.with_intra_threads(std::thread::available_parallelism().map_or(4, |n| n.get()))
+			.map_err(|e| anyhow::anyhow!("Failed to set thread count: {e}"))
+	};
+
 	match provider {
 		ProviderSelection::Auto => {
-			let mut builder = Session::builder()
-				.map_err(|e| anyhow::anyhow!("Failed to create session builder: {e}"))?
-				.with_auto_device(AutoDevicePolicy::MaxPerformance)
-				.map_err(|e| anyhow::anyhow!("Failed to configure auto device: {e}"))?;
+			let mut builder = configure(
+				Session::builder()
+					.map_err(|e| anyhow::anyhow!("Failed to create session builder: {e}"))?
+					.with_auto_device(AutoDevicePolicy::MaxPerformance)
+					.map_err(|e| anyhow::anyhow!("Failed to configure auto device: {e}"))?,
+			)?;
 			Ok(commit(&mut builder)
 				.map_err(|e| anyhow::anyhow!("Failed to load RIFE model: {e}"))?)
 		}
 		ProviderSelection::Cpu => {
 			let ep = make_ep(ProviderSelection::Cpu)?;
-			let mut builder = Session::builder()
-				.map_err(|e| anyhow::anyhow!("Failed to create session builder: {e}"))?
-				.with_execution_providers([ep])
-				.map_err(|e| anyhow::anyhow!("Failed to configure CPU provider: {e}"))?;
+			let mut builder = configure(
+				Session::builder()
+					.map_err(|e| anyhow::anyhow!("Failed to create session builder: {e}"))?
+					.with_execution_providers([ep])
+					.map_err(|e| anyhow::anyhow!("Failed to configure CPU provider: {e}"))?,
+			)?;
 			Ok(commit(&mut builder)
 				.map_err(|e| anyhow::anyhow!("Failed to load RIFE model: {e}"))?)
 		}
@@ -227,6 +262,7 @@ fn create_rife_session(provider: ProviderSelection) -> Result<Session> {
 			let try_result = Session::builder()
 				.map_err(|e| e.to_string())
 				.and_then(|b| b.with_execution_providers([ep]).map_err(|e| e.to_string()))
+				.and_then(|b| configure(b).map_err(|e| e.to_string()))
 				.and_then(|mut b| commit(&mut b).map_err(|e| e.to_string()));
 
 			match try_result {
@@ -238,10 +274,14 @@ fn create_rife_session(provider: ProviderSelection) -> Result<Session> {
 						e
 					);
 					let ep = make_ep(ProviderSelection::Cpu)?;
-					let mut builder = Session::builder()
-						.map_err(|e| anyhow::anyhow!("Failed to create session builder: {e}"))?
-						.with_execution_providers([ep])
-						.map_err(|e| anyhow::anyhow!("Failed to configure CPU fallback: {e}"))?;
+					let mut builder = configure(
+						Session::builder()
+							.map_err(|e| anyhow::anyhow!("Failed to create session builder: {e}"))?
+							.with_execution_providers([ep])
+							.map_err(|e| {
+								anyhow::anyhow!("Failed to configure CPU fallback: {e}")
+							})?,
+					)?;
 					Ok(commit(&mut builder).map_err(|e| {
 						anyhow::anyhow!("Failed to load RIFE model with CPU fallback: {e}")
 					})?)

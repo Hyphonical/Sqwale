@@ -74,11 +74,11 @@ pub fn run(
 		format!("CRF {crf}").truecolor(CLR_VALUE.0, CLR_VALUE.1, CLR_VALUE.2),
 		format!(" {SYM_DOT} ").dimmed(),
 		if ensemble {
-			"ensemble"
+			"Ensemble"
 				.truecolor(CLR_VALUE.0, CLR_VALUE.1, CLR_VALUE.2)
 				.to_string()
 		} else {
-			"standard"
+			"Standard"
 				.truecolor(CLR_VALUE.0, CLR_VALUE.1, CLR_VALUE.2)
 				.to_string()
 		},

@@ -87,7 +87,7 @@ pub fn interp_bar_style() -> ProgressStyle {
 	ProgressStyle::default_bar()
 		.tick_strings(SPINNER_FRAMES)
 		.template(
-			"  {spinner:.cyan} {bar:40.cyan/238}  {pos}/{len} frames · {elapsed_precise} · ~{eta} left",
+			"  {spinner:.cyan} {bar:40.cyan/238}  {pos}/{len} Interpolating… · {elapsed_precise} · ~{eta} left",
 		)
 		.unwrap()
 		.progress_chars("━╌")

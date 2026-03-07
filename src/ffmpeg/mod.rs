@@ -211,6 +211,7 @@ pub fn spawn_writer(
 		.args(["-map", "0:v"])
 		.args(["-map", "1:a?"])
 		.args(["-c:v", "libx264"])
+		.args(["-preset", "fast"])
 		.args(["-crf", &crf.to_string()])
 		.args(["-c:a", "copy"])
 		.args(["-v", "quiet"])
