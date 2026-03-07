@@ -10,6 +10,7 @@
 use anyhow::{Result, bail};
 use ndarray::{Array4, Axis, concatenate, s};
 use ort::session::Session;
+use rayon::prelude::*;
 
 use crate::pipeline::tensor::{crop_tensor, pad_tensor_mirror};
 use crate::pipeline::tiling::Padding;
@@ -150,47 +151,47 @@ impl RifeSession {
 ///
 /// Layout: `(1, 3, H, W)`.
 pub fn bytes_to_tensor(bytes: &[u8], w: usize, h: usize) -> Array4<f32> {
-	let pixels = h * w;
-	let mut data = vec![0.0f32; 3 * pixels];
-	let (r_plane, gb) = data.split_at_mut(pixels);
-	let (g_plane, b_plane) = gb.split_at_mut(pixels);
-	for i in 0..pixels {
-		let src = i * 3;
-		r_plane[i] = bytes[src] as f32 * (1.0 / 255.0);
-		g_plane[i] = bytes[src + 1] as f32 * (1.0 / 255.0);
-		b_plane[i] = bytes[src + 2] as f32 * (1.0 / 255.0);
-	}
-	Array4::from_shape_vec((1, 3, h, w), data).expect("buffer size matches tensor shape")
+	let num_pixels = w * h;
+	let mut planar = vec![0.0f32; num_pixels * 3];
+	let (r_plane, rest) = planar.split_at_mut(num_pixels);
+	let (g_plane, b_plane) = rest.split_at_mut(num_pixels);
+
+	r_plane
+		.par_iter_mut()
+		.zip(g_plane.par_iter_mut())
+		.zip(b_plane.par_iter_mut())
+		.enumerate()
+		.for_each(|(i, ((r, g), b))| {
+			let idx = i * 3;
+			*r = bytes[idx] as f32 / 255.0;
+			*g = bytes[idx + 1] as f32 / 255.0;
+			*b = bytes[idx + 2] as f32 / 255.0;
+		});
+
+	Array4::from_shape_vec((1, 3, h, w), planar).expect("buffer size matches tensor shape")
 }
 
 /// Convert an NCHW f32 tensor `(1, 3, H, W)` back to raw RGB24 bytes.
 ///
 /// Values are clamped to `[0, 1]` before scaling to `[0, 255]`.
-pub fn tensor_to_bytes(tensor: &Array4<f32>, w: usize, h: usize) -> Vec<u8> {
-	let pixels = h * w;
-	let mut bytes = vec![0u8; pixels * 3];
-	// Use contiguous slice access when possible for ~10× speedup over indexed access.
-	if let Some(data) = tensor.as_slice() {
-		let r_plane = &data[..pixels];
-		let g_plane = &data[pixels..2 * pixels];
-		let b_plane = &data[2 * pixels..3 * pixels];
-		for i in 0..pixels {
-			let dst = i * 3;
-			bytes[dst] = (r_plane[i].clamp(0.0, 1.0) * 255.0 + 0.5) as u8;
-			bytes[dst + 1] = (g_plane[i].clamp(0.0, 1.0) * 255.0 + 0.5) as u8;
-			bytes[dst + 2] = (b_plane[i].clamp(0.0, 1.0) * 255.0 + 0.5) as u8;
-		}
-	} else {
-		// Fallback for non-contiguous tensors.
-		for y in 0..h {
-			for x in 0..w {
-				let idx = (y * w + x) * 3;
-				bytes[idx] = (tensor[[0, 0, y, x]].clamp(0.0, 1.0) * 255.0 + 0.5) as u8;
-				bytes[idx + 1] = (tensor[[0, 1, y, x]].clamp(0.0, 1.0) * 255.0 + 0.5) as u8;
-				bytes[idx + 2] = (tensor[[0, 2, y, x]].clamp(0.0, 1.0) * 255.0 + 0.5) as u8;
-			}
-		}
-	}
+pub fn tensor_to_bytes(tensor: &Array4<f32>) -> Vec<u8> {
+	let shape = tensor.shape();
+	let (h, w) = (shape[2], shape[3]);
+	let num_pixels = w * h;
+	let slice = tensor.as_slice().expect("tensor must be contiguous");
+	let r_plane = &slice[0..num_pixels];
+	let g_plane = &slice[num_pixels..num_pixels * 2];
+	let b_plane = &slice[num_pixels * 2..];
+
+	let mut bytes = vec![0u8; num_pixels * 3];
+	bytes
+		.par_chunks_exact_mut(3)
+		.enumerate()
+		.for_each(|(i, pixel)| {
+			pixel[0] = (r_plane[i].clamp(0.0, 1.0) * 255.0 + 0.5) as u8;
+			pixel[1] = (g_plane[i].clamp(0.0, 1.0) * 255.0 + 0.5) as u8;
+			pixel[2] = (b_plane[i].clamp(0.0, 1.0) * 255.0 + 0.5) as u8;
+		});
 	bytes
 }
 

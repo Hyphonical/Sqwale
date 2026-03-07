@@ -12,6 +12,7 @@ use ndarray::Array4;
 use std::io::{BufReader, BufWriter, Write};
 use std::path::Path;
 use std::thread;
+use std::time::Instant;
 use tracing::{debug, info};
 
 use crate::ffmpeg;
@@ -169,13 +170,19 @@ pub fn run(
 				break;
 			}
 
+			let wait_read_start = Instant::now();
 			let buf_b = match read_rx.recv() {
 				Ok(frame) => frame,
 				Err(_) => break, // EOF: no more input frames.
 			};
+			let wait_read_time = wait_read_start.elapsed();
 			frames_read += 1;
 
+			let conv_start = Instant::now();
 			let tensor_b = rife::bytes_to_tensor(&buf_b, info.width, info.height);
+			let conv_time = conv_start.elapsed();
+
+			let infer_start = Instant::now();
 
 			let mids = match generate_midframes(
 				rife,
@@ -192,7 +199,7 @@ pub fn run(
 			};
 
 			for mid in &mids {
-				let bytes = rife::tensor_to_bytes(mid, info.width, info.height);
+				let bytes = rife::tensor_to_bytes(mid);
 				if write_tx.send(bytes).is_err() {
 					inference_result = Err(anyhow::anyhow!("Writer channel closed unexpectedly"));
 					break 'outer;
@@ -208,6 +215,14 @@ pub fn run(
 			}
 			frames_written += 1;
 			report_progress(&options.on_progress, frames_written, total_output_frames);
+
+			let infer_write_time = infer_start.elapsed();
+			debug!(
+				"✦ Wait Read: {:.3} ms | Conv In: {:.3} ms | Infer+Write: {:.3} ms",
+				wait_read_time.as_secs_f64() * 1_000.0,
+				conv_time.as_secs_f64() * 1_000.0,
+				infer_write_time.as_secs_f64() * 1_000.0
+			);
 
 			tensor_a = tensor_b;
 		}

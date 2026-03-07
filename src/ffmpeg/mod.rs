@@ -9,7 +9,7 @@ use std::io::{BufRead, BufReader, Read};
 use std::path::Path;
 use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
 
-use tracing::{debug, warn};
+use tracing::{debug, info, warn};
 
 // ── Video metadata ─────────────────────────────────────────────────────────
 
@@ -54,6 +54,17 @@ struct ProbeStream {
 }
 
 // ── Public API ─────────────────────────────────────────────────────────────
+
+/// Returns `true` if the host FFmpeg installation exposes the `hevc_nvenc` encoder.
+pub(crate) fn supports_nvenc() -> bool {
+	match std::process::Command::new("ffmpeg")
+		.arg("-encoders")
+		.output()
+	{
+		Ok(output) => String::from_utf8_lossy(&output.stdout).contains("hevc_nvenc"),
+		Err(_) => false,
+	}
+}
 
 /// Probe a video file with `ffprobe` and return its metadata.
 pub fn probe(input: &Path) -> Result<VideoInfo> {
@@ -200,8 +211,8 @@ pub fn spawn_writer(
 
 	let size_arg = format!("{width}x{height}");
 
-	let mut child = Command::new("ffmpeg")
-		.arg("-y")
+	let mut cmd = Command::new("ffmpeg");
+	cmd.arg("-y")
 		.args(["-f", "rawvideo"])
 		.args(["-pix_fmt", "rgb24"])
 		.args(["-s", &size_arg])
@@ -209,10 +220,19 @@ pub fn spawn_writer(
 		.args(["-i", "-"])
 		.args(["-i", input_str])
 		.args(["-map", "0:v"])
-		.args(["-map", "1:a?"])
-		.args(["-c:v", "libx264"])
-		.args(["-preset", "fast"])
-		.args(["-crf", &crf.to_string()])
+		.args(["-map", "1:a?"]);
+
+	if supports_nvenc() {
+		info!("Hardware encoding: using hevc_nvenc (preset p4)");
+		cmd.args(["-c:v", "hevc_nvenc"]).args(["-preset", "p4"]);
+	} else {
+		info!("Hardware encoding unavailable: falling back to libx264 (preset fast)");
+		cmd.args(["-c:v", "libx264"])
+			.args(["-preset", "fast"])
+			.args(["-crf", &crf.to_string()]);
+	}
+
+	let mut child = cmd
 		.args(["-c:a", "copy"])
 		.args(["-v", "quiet"])
 		.arg(output_str)

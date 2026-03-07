@@ -105,7 +105,7 @@ pub fn run(
 			" fps".dimmed()
 		),
 		format_args!(
-			"~{} Interpolating…",
+			"~{} frames",
 			info.frame_count
 				.to_string()
 				.truecolor(CLR_VALUE.0, CLR_VALUE.1, CLR_VALUE.2)
