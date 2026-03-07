@@ -37,19 +37,18 @@ jobs:
       - name: 🚧 Build Release
         run: cargo build --release --all-features --target x86_64-pc-windows-msvc
 
-      - name: 📦 Package
+      - name: 📦 Stage Files
         run: |
           mkdir dist
           copy target\x86_64-pc-windows-msvc\release\sqwale.exe dist\
           copy LICENSE dist\
           copy README.md dist\
-          cd dist
-          7z a -mx=9 ..\sqwale-windows-x64.zip *
 
       - name: 📤 Upload
         uses: actions/upload-artifact@v4
         with:
           name: sqwale-windows-x64
-          path: sqwale-windows-x64.zip
+          path: dist/*
+          compression-level: 9
           if-no-files-found: error
           retention-days: 7

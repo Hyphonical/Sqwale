@@ -37,18 +37,17 @@ jobs:
       - name: 🚧 Build Release
         run: cargo build --release --all-features --target aarch64-apple-darwin
 
-      - name: 📦 Package
+      - name: 📦 Stage Files
         run: |
           mkdir -p dist
           cp target/aarch64-apple-darwin/release/sqwale dist/
           cp LICENSE README.md dist/
-          cd dist
-          tar czf ../sqwale-macos-arm64.tar.gz *
 
       - name: 📤 Upload
         uses: actions/upload-artifact@v4
         with:
           name: sqwale-macos-arm64
-          path: sqwale-macos-arm64.tar.gz
+          path: dist/*
+          compression-level: 9
           if-no-files-found: error
           retention-days: 7

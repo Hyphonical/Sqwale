@@ -37,18 +37,17 @@ jobs:
       - name: 🚧 Build Release
         run: cargo build --release --all-features --target x86_64-unknown-linux-gnu
 
-      - name: 📦 Package
+      - name: 📦 Stage Files
         run: |
           mkdir -p dist
           cp target/x86_64-unknown-linux-gnu/release/sqwale dist/
           cp LICENSE README.md dist/
-          cd dist
-          tar czf ../sqwale-linux-x64.tar.gz *
 
       - name: 📤 Upload
         uses: actions/upload-artifact@v4
         with:
           name: sqwale-linux-x64
-          path: sqwale-linux-x64.tar.gz
+          path: dist/*
+          compression-level: 9
           if-no-files-found: error
           retention-days: 7
