@@ -17,7 +17,7 @@ name = "sqwale"
 path = "src/lib.rs"
 
 [dependencies]
-# ── Model Loading & Inference ──────────────────────────────────────────────
+# ── Model Loading & Inference ─────────────────────────────────────────────
 ort     = { version = "2.0.0-rc.12", features = ["api-24", "half"] }
 ndarray = { version = "0.17", default-features = false }
 half    = "2"
@@ -28,7 +28,9 @@ image = { version = "0.25", default-features = false, features = [
 ] }
 
 # ── CLI & Output ──────────────────────────────────────────────────────────
-clap      = { version = "4", default-features = false, features = ["derive", "std", "help", "usage", "error-context"] }
+clap      = { version = "4", default-features = false, features = [
+    "derive", "std", "help", "usage", "error-context"
+] }
 colored   = "3"
 indicatif = "0.18"
 ctrlc     = "3"
@@ -46,8 +48,8 @@ serde_json = "1"
 anyhow            = "1"
 crossbeam-channel = "0.5"
 glob              = "0.3"
-realfft = "3.5.0"
-rustfft = "6.4.1"
+realfft           = "3.5.0"
+rustfft           = "6.4.1"
 
 [profile.release.package."*"]
 opt-level = 3
