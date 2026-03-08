@@ -14,23 +14,15 @@ A fast, cross-platform CLI for AI-powered video and image enhancement. Frame int
 - 🔀 **Frequency blending** — mix AI output with Lanczos upscale via an FFT Laplacian pyramid
 - 🎛️ **Ensemble mode** — horizontal-flip averaging for higher fidelity RIFE output
 - 📦 **Zero-disk video pipeline** — all frame data flows through OS pipes; no temp files written
+- 🚀 **Prefetch pipeline** — batch upscaling loads the next image from disk while the GPU is busy
 - 🎨 **Clean terminal output** — progress bars, per-tile timing, coloured status lines
 - 🛑 **Graceful cancellation** — Ctrl+C finishes the current item; second press exits immediately
 
 ---
 
-## 🗺️ Roadmap
-
-- [ ] 🎬 **Video upscaling** — run super-resolution models frame-by-frame on video files
-- [ ] 🔁 **Multi-model chaining** — compose upscale + interpolate in a single pass
-- [ ] 🧪 **Benchmark mode** — measure throughput across providers and tile sizes
-- [ ] 📊 **Verbose scene stats** — report scene cut count and timestamps after interpolation
-
----
-
 ## 📦 Installation
 
-Requires Rust 1.85 or later. For video commands, [FFmpeg](https://ffmpeg.org/download.html) must be on your `PATH`.
+Requires Rust **1.85** or later. For `interpolate`, [FFmpeg](https://ffmpeg.org/download.html) **≥ 5.1** must be on your `PATH` (the `-vf colorspace` filter used for raw-frame decoding was introduced in 5.1).
 
 ```bash
 git clone https://github.com/Hyphonical/Sqwale.git
@@ -79,6 +71,8 @@ sqwale interpolate input.mp4 -o output.mkv
 
 When `--scene-detect` is enabled, each pair of consecutive frames is scored using mean absolute difference (the same algorithm as FFmpeg's `scdet` filter). If the score exceeds the threshold, the last pre-cut frame is duplicated `(multiplier − 1)` times instead of running RIFE inference. This keeps the output frame count correct for audio sync while avoiding the blurry ghosting that RIFE produces across hard cuts.
 
+> **See also:** [docs/architecture.md](docs/architecture.md) for a detailed explanation of the three-stage interpolation pipeline.
+
 ### Interpolate options
 
 | Option | Description | Default |
@@ -122,7 +116,7 @@ sqwale upscale input.png -m model.onnx --blend 0.5
 ✓ input_4x.jpg  27s
 ```
 
-Batch mode shows dual progress bars — per-image tile progress on top, overall batch progress with ETA below:
+Batch mode shows dual progress bars — per-image tile progress on top, overall batch progress with ETA below. A background prefetch thread keeps up to 2 images loaded from disk while the GPU is processing the current one:
 
 ```
 ● [1/5] photos/img1.jpg
@@ -130,6 +124,8 @@ Batch mode shows dual progress bars — per-image tile progress on top, overall 
   ━━━━━━━━━━━━━━━━━━━━╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌  12/24 tiles  1m 02s  3.9s/tile
   ━━━━━━━━╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌   1/5  images  1m 02s  ~4m 08s remaining
 ```
+
+> **See also:** [docs/architecture.md](docs/architecture.md) for a detailed explanation of the batch prefetch pipeline.
 
 ### Upscale options
 
@@ -189,6 +185,8 @@ sqwale interpolate input.mp4 --provider cuda
 sqwale upscale input.png -m model.onnx --provider cpu
 ```
 
+> **See also:** [docs/providers.md](docs/providers.md) for per-provider install requirements.
+
 ---
 
 ## 🧩 Tiling
@@ -198,6 +196,8 @@ Large images are split into overlapping tiles, each processed independently, the
 - **Dynamic models** use `--tile-size` (default 512 px), respecting model-alignment requirements.
 - **Fixed-size models** automatically use the model's required tile dimensions.
 - **Disable tiling** with `--tile-size 0` to process the full image at once.
+
+> **See also:** [docs/tiling.md](docs/tiling.md) for a detailed guide including VRAM budgeting.
 
 ---
 
@@ -220,6 +220,8 @@ Works with ONNX super-resolution models that use:
 
 The bundled default is [4xLSDIRCompactv2](https://openmodeldb.info/models/4x-LSDIRCompact-v2) by Phhofm, licensed under [CC BY 4.0](https://creativecommons.org/licenses/by/4.0/).
 
+> **See also:** [docs/models.md](docs/models.md) for model selection advice and compatibility notes.
+
 ---
 
 ## 🌍 Environment variables
@@ -229,6 +231,17 @@ The bundled default is [4xLSDIRCompactv2](https://openmodeldb.info/models/4x-LSD
 | `NO_COLOR` | Disable coloured output |
 | `CI` | Disable colours and progress bars |
 | `RUST_LOG` | Log verbosity (e.g. `sqwale=debug`) |
+
+---
+
+## 📚 Documentation
+
+| Doc | Contents |
+|---|---|
+| [docs/architecture.md](docs/architecture.md) | Pipeline internals: channel layout, thread roles, frame flow |
+| [docs/tiling.md](docs/tiling.md) | Tile sizing, overlap, Hann blending, VRAM budgeting |
+| [docs/providers.md](docs/providers.md) | GPU provider setup, platform matrix, fallback behaviour |
+| [docs/models.md](docs/models.md) | Model compatibility, scale detection, format requirements |
 
 ---
 

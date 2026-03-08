@@ -2,10 +2,13 @@
 
 use anyhow::{Context, Result, bail};
 use colored::Colorize;
+use crossbeam_channel::bounded;
+use image::DynamicImage;
 use indicatif::{MultiProgress, ProgressBar};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::thread;
 use std::time::{Duration, Instant};
 
 use sqwale::imageio;
@@ -289,7 +292,22 @@ fn run_single(
 	Ok(())
 }
 
+/// A prefetched image ready for GPU processing.
+struct PrefetchedImage {
+	/// Original index in the input list (0-based).
+	index: usize,
+	/// Resolved input path.
+	input: PathBuf,
+	/// Resolved output path.
+	output: PathBuf,
+	/// Load result — an error here is collected, not fatal to the whole batch.
+	result: Result<DynamicImage>,
+}
+
 /// Run upscale for a batch of images.
+///
+/// A background prefetch thread loads images from disk through a `bounded(2)`
+/// channel so disk I/O overlaps GPU inference, keeping the GPU fed.
 #[allow(clippy::too_many_arguments)]
 fn run_batch(
 	inputs: &[PathBuf],
@@ -373,6 +391,43 @@ fn run_batch(
 		pb
 	});
 
+	// Prefetch thread: resolves output paths and loads images from disk,
+	// keeping up to 2 images buffered ahead of the GPU loop.
+	let (prefetch_tx, prefetch_rx) = bounded::<PrefetchedImage>(2);
+	let prefetch_inputs: Vec<PathBuf> = inputs.to_vec();
+	let prefetch_cancel = cancel.clone();
+	// Convert to owned so the closure can be `'static`.
+	let prefetch_output_dir: Option<PathBuf> = output_dir.map(Path::to_path_buf);
+	let prefetch_handle = thread::spawn(move || {
+		for (index, input) in prefetch_inputs.into_iter().enumerate() {
+			if prefetch_cancel.is_cancelled() {
+				break;
+			}
+			let output_result = resolve_batch_output(&input, prefetch_output_dir.as_deref(), scale);
+			let item = match output_result {
+				Err(e) => PrefetchedImage {
+					index,
+					output: PathBuf::new(),
+					result: Err(e),
+					input,
+				},
+				Ok(output) => {
+					let result = imageio::load_image(&input);
+					PrefetchedImage {
+						index,
+						input,
+						output,
+						result,
+					}
+				}
+			};
+			if prefetch_tx.send(item).is_err() {
+				break;
+			}
+		}
+	});
+
+	let total = inputs.len();
 	let batch_start = Instant::now();
 	let mut succeeded = 0usize;
 	let mut failed: Vec<(PathBuf, String)> = Vec::new();
@@ -386,9 +441,14 @@ fn run_batch(
 		}
 	};
 
-	for (i, input) in inputs.iter().enumerate() {
+	// GPU loop: drains the prefetch channel.
+	for item in &prefetch_rx {
+		let i = item.index;
+
 		if cancel.is_cancelled() {
-			skipped = inputs.len() - i;
+			// Drain remaining items so the prefetch thread can exit cleanly.
+			drop(prefetch_rx);
+			skipped = total.saturating_sub(i);
 			print_line(
 				&multi,
 				format!(
@@ -404,7 +464,7 @@ fn run_batch(
 		// Update batch bar.
 		if let Some(ref pb) = batch_pb {
 			pb.set_position(i as u64);
-			update_batch_message(pb, i, inputs.len(), batch_start);
+			update_batch_message(pb, i, total, batch_start);
 		}
 
 		// Reset tile bar for this image.
@@ -414,7 +474,7 @@ fn run_batch(
 			pb.set_message("".to_string());
 		}
 
-		// Per-image header.
+		// Per-image header — printed here (GPU side) not during prefetch.
 		print_line(
 			&multi,
 			format!(
@@ -422,31 +482,37 @@ fn run_batch(
 				SYM_BULLET.cyan().bold(),
 				"[".dimmed(),
 				(i + 1).to_string().bold().bright_white(),
-				format!("/{}]", inputs.len()).dimmed(),
-				path_str(&input.display().to_string())
+				format!("/{total}]").dimmed(),
+				path_str(&item.input.display().to_string())
 			),
 		);
 
-		let output_path = match resolve_batch_output(input, output_dir, scale) {
-			Ok(p) => p,
+		let img = match item.result {
 			Err(e) => {
-				failed.push((input.clone(), format!("{e:#}")));
+				let msg = format!("{e:#}");
+				failed.push((item.input.clone(), msg.clone()));
 				print_line(
 					&multi,
 					format!(
 						"  {} {} {}",
 						SYM_CROSS.red().bold(),
-						"Failed to resolve output path".white(),
-						format!("{e:#}").dimmed()
+						"Failed to load image".white(),
+						msg.dimmed()
 					),
 				);
+				print_line(&multi, String::new());
+				if let Some(ref pb) = batch_pb {
+					pb.set_position((i + 1) as u64);
+					update_batch_message(pb, i + 1, total, batch_start);
+				}
 				continue;
 			}
+			Ok(img) => img,
 		};
 
 		match process_single_image(
-			input,
-			&output_path,
+			&img,
+			&item.output,
 			ctx,
 			tile_size,
 			tile_overlap,
@@ -461,10 +527,10 @@ fn run_batch(
 			Err(e) => {
 				let msg = format!("{e:#}");
 				if msg == "Cancelled" {
-					skipped = inputs.len() - i;
+					skipped = total.saturating_sub(i);
 					break;
 				}
-				failed.push((input.clone(), msg.clone()));
+				failed.push((item.input.clone(), msg.clone()));
 				print_line(
 					&multi,
 					format!(
@@ -480,11 +546,13 @@ fn run_batch(
 		// Update batch bar after completing this image.
 		if let Some(ref pb) = batch_pb {
 			pb.set_position((i + 1) as u64);
-			update_batch_message(pb, i + 1, inputs.len(), batch_start);
+			update_batch_message(pb, i + 1, total, batch_start);
 		}
 
 		print_line(&multi, String::new());
 	}
+
+	prefetch_handle.join().expect("prefetch thread panicked");
 
 	// Clear both bars.
 	if let Some(ref pb) = tile_pb {
@@ -500,9 +568,7 @@ fn run_batch(
 			"\n{} {}{}{}",
 			SYM_CROSS.red().bold(),
 			"Cancelled after ".white(),
-			format!("{succeeded}/{}", inputs.len())
-				.bold()
-				.bright_white(),
+			format!("{succeeded}/{total}").bold().bright_white(),
 			"".normal()
 		);
 	}
@@ -570,12 +636,14 @@ fn update_batch_message(pb: &ProgressBar, done: usize, total: usize, start: Inst
 	));
 }
 
-/// Process a single image within a batch.
+/// Process a single already-loaded image within a batch.
 ///
+/// Receives the decoded image rather than a path so that loading has already
+/// happened on the prefetch thread, overlapping disk I/O with GPU inference.
 /// The tile progress bar is owned by the caller and reused across images.
 #[allow(clippy::too_many_arguments)]
 fn process_single_image(
-	input: &Path,
+	img: &DynamicImage,
 	output_path: &Path,
 	ctx: &mut sqwale::SessionContext,
 	tile_size: u32,
@@ -593,7 +661,6 @@ fn process_single_image(
 		}
 	};
 
-	let img = imageio::load_image(input)?;
 	let (img_w, img_h) = (img.width(), img.height());
 
 	print_line(format!(
@@ -649,7 +716,7 @@ fn process_single_image(
 		},
 	};
 
-	let result = sqwale::pipeline::upscale_image(ctx, &img, &options);
+	let result = sqwale::pipeline::upscale_image(ctx, img, &options);
 
 	// Clear the tile bar but don't remove it from MultiProgress — it's reused.
 	if let Some(pb) = tile_pb {
