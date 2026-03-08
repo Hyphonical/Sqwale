@@ -445,17 +445,23 @@ fn report_progress(
 	}
 }
 
-/// Compute a scene change score between two raw RGB24 frames.
+/// Compute a scene change score between two raw RGB24 frames using parallel CPU processing.
 ///
 /// Returns a value in `[0.0, 1.0]` where `0.0` means identical frames and
 /// `1.0` means maximally different. Uses the mean absolute difference of all
-/// channel values, normalised by 255 — the same formula as FFmpeg’s `scdet`
+/// channel values, normalised by 255 — the same formula as FFmpeg's `scdet`
 /// filter, so thresholds are directly comparable.
+///
+/// Uses Rayon's parallel iterators to split the computation across all
+/// available CPU cores, eliminating the single-threaded bottleneck for
+/// large frame buffers (~6.2 MB per 1080p RGB24 frame).
 fn scene_score(a: &[u8], b: &[u8]) -> f64 {
+	use rayon::prelude::*;
+
 	debug_assert_eq!(a.len(), b.len(), "scene_score: frame size mismatch");
 	let sad: u64 = a
-		.iter()
-		.zip(b.iter())
+		.par_iter()
+		.zip(b.par_iter())
 		.map(|(&x, &y)| x.abs_diff(y) as u64)
 		.sum();
 	sad as f64 / (a.len() as f64 * 255.0)

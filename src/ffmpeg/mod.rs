@@ -159,12 +159,26 @@ pub fn probe(input: &Path) -> Result<VideoInfo> {
 }
 
 /// Spawn an FFmpeg process that decodes all video frames to raw RGB24 on stdout.
+///
+/// Uses GPU hardware acceleration (CUDA) for video decoding if available,
+/// otherwise falls back to CPU decoding.
 pub fn spawn_reader(input: &Path) -> Result<(Child, ChildStdout)> {
 	let input_str = input
 		.to_str()
 		.context("Input path contains invalid UTF-8")?;
 
-	let mut child = Command::new("ffmpeg")
+	let mut cmd = Command::new("ffmpeg");
+
+	// Enable CUDA hardware acceleration if GPU is available.
+	// Note: We intentionally omit -hwaccel_output_format cuda so that FFmpeg
+	// downloads decoded frames back to CPU memory for the raw pipe output.
+	// Using hwaccel_output_format cuda would keep frames as CUDA surfaces,
+	// which cannot be piped as rgb24 without an explicit hwdownload filter.
+	if supports_nvenc() {
+		cmd.args(["-hwaccel", "cuda"]);
+	}
+
+	let mut child = cmd
 		.args(["-i", input_str])
 		.args(["-f", "rawvideo"])
 		.args(["-pix_fmt", "rgb24"])
