@@ -64,7 +64,7 @@ panic         = "abort"
 
 [profile.fast]
 inherits      = "release"
-opt-level     = 1
+opt-level     = 3
 debug         = 0
 codegen-units = 32
 incremental   = true
