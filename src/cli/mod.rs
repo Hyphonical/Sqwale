@@ -45,6 +45,19 @@ fn parse_blend(s: &str) -> Result<f32, String> {
 	}
 }
 
+fn parse_scene_threshold(s: &str) -> Result<f64, String> {
+	let v: f64 = s
+		.parse()
+		.map_err(|_| format!("'{s}' is not a valid number"))?;
+	if (0.0..=1.0).contains(&v) {
+		Ok(v)
+	} else {
+		Err(format!(
+			"scene threshold {v} is out of range, must be 0.0–1.0"
+		))
+	}
+}
+
 #[derive(Subcommand)]
 pub enum Commands {
 	/// Inspect ONNX model metadata without running inference.
@@ -90,5 +103,16 @@ pub enum Commands {
 		/// Use ensemble mode (horizontal-flip averaging) for higher quality.
 		#[arg(long)]
 		ensemble: bool,
+
+		/// Detect scene changes and duplicate the last pre-cut frame instead of
+		/// interpolating across cuts. Prevents blurry or ghosted transitions.
+		#[arg(long)]
+		scene_detect: bool,
+
+		/// Scene change detection sensitivity [0.0–1.0].
+		/// Lower values detect subtler cuts; higher values only catch hard cuts.
+		/// Has no effect unless `--scene-detect` is also set.
+		#[arg(long, default_value_t = 0.4, value_parser = parse_scene_threshold)]
+		scene_threshold: f64,
 	},
 }

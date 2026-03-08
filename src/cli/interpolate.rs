@@ -15,15 +15,24 @@ use sqwale::session::ProviderSelection;
 use super::Cli;
 use super::output::*;
 
+/// Interpolation settings derived from CLI arguments.
+pub struct InterpolateArgs {
+	pub multiplier: u32,
+	pub crf: u32,
+	pub ensemble: bool,
+	pub scene_detect: bool,
+	pub scene_threshold: f64,
+}
+
 /// Run the interpolate command.
-pub fn run(
-	input: &str,
-	output_arg: Option<&str>,
-	multiplier: u32,
-	crf: u32,
-	ensemble: bool,
-	args: &Cli,
-) -> Result<()> {
+pub fn run(input: &str, output_arg: Option<&str>, ia: InterpolateArgs, args: &Cli) -> Result<()> {
+	let InterpolateArgs {
+		multiplier,
+		crf,
+		ensemble,
+		scene_detect,
+		scene_threshold,
+	} = ia;
 	// Validate input file exists.
 	let input_path = Path::new(input);
 	if !input_path.exists() {
@@ -68,7 +77,7 @@ pub fn run(
 
 	// Configuration line.
 	let config_summary = format!(
-		"{}{}{}{}{}",
+		"{}{}{}{}{}{}",
 		format!("{multiplier}×").truecolor(CLR_VALUE.0, CLR_VALUE.1, CLR_VALUE.2),
 		format!(" {SYM_DOT} ").dimmed(),
 		format!("CRF {crf}").truecolor(CLR_VALUE.0, CLR_VALUE.1, CLR_VALUE.2),
@@ -81,6 +90,19 @@ pub fn run(
 			"Standard"
 				.truecolor(CLR_VALUE.0, CLR_VALUE.1, CLR_VALUE.2)
 				.to_string()
+		},
+		if scene_detect {
+			format!(
+				"{}{}",
+				format!(" {SYM_DOT} ").dimmed(),
+				format!("Scene {scene_threshold:.2}").truecolor(
+					CLR_VALUE.0,
+					CLR_VALUE.1,
+					CLR_VALUE.2
+				),
+			)
+		} else {
+			String::new()
 		},
 	);
 	println!(
@@ -139,6 +161,7 @@ pub fn run(
 		multiplier,
 		ensemble,
 		crf,
+		scene_detect_threshold: scene_detect.then_some(scene_threshold),
 		cancel: cancel.clone(),
 		on_progress: Some(Box::new(move |done, total| {
 			if let Some(ref pb) = pb_clone {

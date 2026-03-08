@@ -319,7 +319,7 @@ mod tests {
 	fn tensor_to_bytes_roundtrip() {
 		let bytes: Vec<u8> = vec![128, 64, 200, 0, 255, 100, 50, 150, 250, 10, 20, 30];
 		let t = bytes_to_tensor(&bytes, 2, 2);
-		let result = tensor_to_bytes(&t, 2, 2);
+		let result = tensor_to_bytes(&t);
 		assert_eq!(bytes, result);
 	}
 

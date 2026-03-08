@@ -40,13 +40,19 @@ fn main() -> Result<()> {
 			multiplier,
 			crf,
 			ensemble,
+			scene_detect,
+			scene_threshold,
 		} => {
 			cli::interpolate::run(
 				input,
 				output.as_deref(),
-				*multiplier,
-				*crf,
-				*ensemble,
+				cli::interpolate::InterpolateArgs {
+					multiplier: *multiplier,
+					crf: *crf,
+					ensemble: *ensemble,
+					scene_detect: *scene_detect,
+					scene_threshold: *scene_threshold,
+				},
 				&args,
 			)?;
 		}

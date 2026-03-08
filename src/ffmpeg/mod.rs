@@ -34,6 +34,14 @@ pub struct VideoInfo {
 #[derive(Deserialize)]
 struct ProbeOutput {
 	streams: Vec<ProbeStream>,
+	#[serde(default)]
+	format: Option<ProbeFormat>,
+}
+
+#[derive(Deserialize)]
+struct ProbeFormat {
+	#[serde(default)]
+	duration: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -76,6 +84,7 @@ pub fn probe(input: &Path) -> Result<VideoInfo> {
 		.args(["-v", "quiet"])
 		.args(["-print_format", "json"])
 		.args(["-show_streams"])
+		.args(["-show_format"])
 		.arg(input_str)
 		.stdout(Stdio::piped())
 		.stderr(Stdio::null())
@@ -124,18 +133,15 @@ pub fn probe(input: &Path) -> Result<VideoInfo> {
 	let fps_str = r_frame_rate;
 
 	// Estimate frame count.
-	let frame_count = video
-		.nb_frames
-		.as_deref()
-		.and_then(|s| s.parse::<usize>().ok())
-		.or_else(|| {
-			video
-				.duration
-				.as_deref()
-				.and_then(|s| s.parse::<f64>().ok())
-				.map(|dur| (dur * fps).round() as usize)
-		})
-		.unwrap_or(0);
+	let frame_count = estimate_frame_count(
+		video.nb_frames.as_deref(),
+		video.duration.as_deref(),
+		probe
+			.format
+			.as_ref()
+			.and_then(|format| format.duration.as_deref()),
+		fps,
+	);
 
 	debug!(
 		"Probed video: {}×{}, {} fps ({}), ~{} frames, audio={}",
@@ -345,6 +351,29 @@ fn parse_rational_fps(s: &str) -> f64 {
 	}
 }
 
+fn estimate_frame_count(
+	nb_frames: Option<&str>,
+	stream_duration: Option<&str>,
+	format_duration: Option<&str>,
+	fps: f64,
+) -> usize {
+	nb_frames
+		.and_then(|value| value.parse::<usize>().ok())
+		.or_else(|| {
+			parse_duration_seconds(stream_duration)
+				.map(|duration| (duration * fps).round() as usize)
+		})
+		.or_else(|| {
+			parse_duration_seconds(format_duration)
+				.map(|duration| (duration * fps).round() as usize)
+		})
+		.unwrap_or(0)
+}
+
+fn parse_duration_seconds(value: Option<&str>) -> Option<f64> {
+	value.and_then(|duration| duration.parse::<f64>().ok())
+}
+
 // ── Tests ──────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -373,5 +402,29 @@ mod tests {
 		assert!((parse_rational_fps("24000/1001") - 23.976).abs() < 0.01);
 		assert!((parse_rational_fps("30") - 30.0).abs() < 0.01);
 		assert!((parse_rational_fps("0/0") - 0.0).abs() < 0.01);
+	}
+
+	#[test]
+	fn estimate_frame_count_prefers_nb_frames() {
+		assert_eq!(
+			estimate_frame_count(Some("483"), Some("20.132"), Some("20.141"), 24.0),
+			483
+		);
+	}
+
+	#[test]
+	fn estimate_frame_count_uses_stream_duration_when_present() {
+		assert_eq!(
+			estimate_frame_count(None, Some("20.132"), Some("20.141"), 24.0),
+			483
+		);
+	}
+
+	#[test]
+	fn estimate_frame_count_falls_back_to_format_duration() {
+		assert_eq!(
+			estimate_frame_count(None, None, Some("20.141000"), 24.0),
+			483
+		);
 	}
 }

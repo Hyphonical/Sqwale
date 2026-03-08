@@ -31,6 +31,15 @@ pub struct InterpolateOptions {
 	/// x264 CRF value for the output encoder.
 	pub crf: u32,
 
+	/// When `Some(threshold)`, frames whose pixel difference exceeds the
+	/// threshold are treated as scene cuts: the last pre-cut frame is
+	/// duplicated instead of running RIFE inference.
+	///
+	/// The threshold is a value in `[0.0, 1.0]` using the same mean-absolute-
+	/// difference formula as FFmpeg's `scdet` filter. `0.4` is a sensible
+	/// default for hard scene cuts.
+	pub scene_detect_threshold: Option<f64>,
+
 	/// Cooperative cancellation token.
 	pub cancel: CancelToken,
 
@@ -142,7 +151,7 @@ pub fn run(
 		let mut tensor_a = rife::bytes_to_tensor(&buf_a, info.width, info.height);
 		frames_read = 1;
 
-		// Log padding info once (it's constant for all frames).
+		// Log padding info once (it’s constant for all frames).
 		let pad_h = (32 - (info.height % 32)) % 32;
 		let pad_w = (32 - (info.width % 32)) % 32;
 		debug!(
@@ -154,6 +163,10 @@ pub fn run(
 			pad_h,
 			pad_w
 		);
+
+		// Track the previous frame’s raw bytes so scene detection can compare
+		// them against the incoming frame B. Only allocated when needed.
+		let mut prev_buf: Option<Vec<u8>> = options.scene_detect_threshold.map(|_| buf_a.clone());
 
 		// Pass the first frame through to the writer unchanged.
 		if write_tx.send(buf_a).is_ok() {
@@ -184,28 +197,70 @@ pub fn run(
 
 			let infer_start = Instant::now();
 
-			let mids = match generate_midframes(
-				rife,
-				&tensor_a,
-				&tensor_b,
-				options.multiplier,
-				options.ensemble,
-			) {
-				Ok(m) => m,
-				Err(e) => {
-					inference_result = Err(e);
-					break;
-				}
-			};
+			// Check for a scene cut before committing to inference.
+			let is_scene_cut = prev_buf
+				.as_deref()
+				.zip(options.scene_detect_threshold)
+				.is_some_and(|(prev, threshold)| {
+					let score = scene_score(prev, &buf_b);
+					if score > threshold {
+						debug!(
+							"Scene cut at frame {} (score={:.3}, threshold={:.3})",
+							frames_read, score, threshold
+						);
+						true
+					} else {
+						false
+					}
+				});
 
-			for mid in &mids {
-				let bytes = rife::tensor_to_bytes(mid);
-				if write_tx.send(bytes).is_err() {
-					inference_result = Err(anyhow::anyhow!("Writer channel closed unexpectedly"));
-					break 'outer;
+			if is_scene_cut {
+				// Duplicate the last pre-cut frame (multiplier − 1) times to
+				// maintain the correct output frame count without blending
+				// across the cut.
+				{
+					let dup = prev_buf.as_ref().unwrap();
+					for _ in 0..(options.multiplier - 1) {
+						if write_tx.send(dup.clone()).is_err() {
+							inference_result =
+								Err(anyhow::anyhow!("Writer channel closed unexpectedly"));
+							break 'outer;
+						}
+						frames_written += 1;
+						report_progress(&options.on_progress, frames_written, total_output_frames);
+					}
 				}
-				frames_written += 1;
-				report_progress(&options.on_progress, frames_written, total_output_frames);
+				*prev_buf.as_mut().unwrap() = buf_b.clone();
+			} else {
+				// Normal RIFE inference path.
+				let mids = match generate_midframes(
+					rife,
+					&tensor_a,
+					&tensor_b,
+					options.multiplier,
+					options.ensemble,
+				) {
+					Ok(m) => m,
+					Err(e) => {
+						inference_result = Err(e);
+						break;
+					}
+				};
+
+				for mid in &mids {
+					let bytes = rife::tensor_to_bytes(mid);
+					if write_tx.send(bytes).is_err() {
+						inference_result =
+							Err(anyhow::anyhow!("Writer channel closed unexpectedly"));
+						break 'outer;
+					}
+					frames_written += 1;
+					report_progress(&options.on_progress, frames_written, total_output_frames);
+				}
+
+				if let Some(ref mut pb) = prev_buf {
+					*pb = buf_b.clone();
+				}
 			}
 
 			// Send frame B and slide the window.
@@ -352,4 +407,20 @@ fn report_progress(
 	if let Some(f) = cb {
 		f(done, total);
 	}
+}
+
+/// Compute a scene change score between two raw RGB24 frames.
+///
+/// Returns a value in `[0.0, 1.0]` where `0.0` means identical frames and
+/// `1.0` means maximally different. Uses the mean absolute difference of all
+/// channel values, normalised by 255 — the same formula as FFmpeg’s `scdet`
+/// filter, so thresholds are directly comparable.
+fn scene_score(a: &[u8], b: &[u8]) -> f64 {
+	debug_assert_eq!(a.len(), b.len(), "scene_score: frame size mismatch");
+	let sad: u64 = a
+		.iter()
+		.zip(b.iter())
+		.map(|(&x, &y)| x.abs_diff(y) as u64)
+		.sum();
+	sad as f64 / (a.len() as f64 * 255.0)
 }
