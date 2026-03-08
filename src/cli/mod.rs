@@ -45,6 +45,17 @@ fn parse_blend(s: &str) -> Result<f32, String> {
 	}
 }
 
+fn parse_grain(s: &str) -> Result<u8, String> {
+	let v: u8 = s
+		.parse()
+		.map_err(|_| format!("'{s}' is not a valid number"))?;
+	if v <= 100 {
+		Ok(v)
+	} else {
+		Err(format!("grain strength {v} is out of range, must be 0–100"))
+	}
+}
+
 fn parse_scene_threshold(s: &str) -> Result<f64, String> {
 	let v: f64 = s
 		.parse()
@@ -80,6 +91,13 @@ pub enum Commands {
 		/// Omit to write next to the input as `{stem}_{scale}x.{ext}`.
 		#[arg(short, long)]
 		output: Option<String>,
+
+		/// Add monochrome luma noise post-upscale to reduce the "plastic" AI look.
+		/// Scale is 0 to 100. (Recommended: 5 for subtle texture, 20 for heavy film grain).
+		///
+		/// [default: 0]
+		#[arg(long, default_value_t = 0, value_parser = parse_grain)]
+		grain: u8,
 	},
 
 	/// Interpolate video frames using RIFE 4.25 (requires FFmpeg).
@@ -114,5 +132,10 @@ pub enum Commands {
 		/// Has no effect unless `--scene-detect` is also set.
 		#[arg(long, default_value_t = 0.4, value_parser = parse_scene_threshold)]
 		scene_threshold: f64,
+
+		/// Use the fp16-quantized RIFE model (lower VRAM, faster on compatible hardware).
+		/// Inputs and outputs remain float32; quantization is internal only.
+		#[arg(long)]
+		fp16: bool,
 	},
 }

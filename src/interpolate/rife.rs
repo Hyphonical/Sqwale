@@ -16,8 +16,15 @@ use crate::pipeline::tensor::{crop_tensor, pad_tensor_mirror};
 use crate::pipeline::tiling::Padding;
 use crate::session::{ProviderSelection, make_ep};
 
-/// RIFE 4.25 embedded model bytes.
-const RIFE_MODEL_BYTES: &[u8] = include_bytes!("../../models/rife425_fp32_op21_slim.onnx");
+/// RIFE 4.25 embedded model bytes — standard float32 weights.
+const RIFE_FP32_MODEL_BYTES: &[u8] = include_bytes!("../../models/rife425_fp32_op21_slim.onnx");
+
+/// RIFE 4.25 embedded model bytes — fp16-quantized weights.
+///
+/// Exported with `keep_io_types=True`, so Rust still passes and receives
+/// float32 tensors; ORT converts the data internally. This typically halves
+/// VRAM usage and speeds up inference on fp16-capable hardware.
+const RIFE_FP16_MODEL_BYTES: &[u8] = include_bytes!("../../models/rife425_fp16_op21_slim.onnx");
 
 /// Alignment requirement for RIFE spatial dimensions.
 const RIFE_ALIGNMENT: usize = 32;
@@ -30,9 +37,13 @@ pub struct RifeSession {
 impl RifeSession {
 	/// Create a new RIFE session using the given execution provider.
 	///
+	/// When `fp16` is `true`, the quantized model is loaded. External I/O
+	/// remains float32 because the model was exported with `keep_io_types=True`,
+	/// so ensemble mode and all other inference paths work identically.
+	///
 	/// Reuses the same provider-fallback logic as the upscale pipeline.
-	pub fn new(provider: ProviderSelection) -> Result<Self> {
-		let session = create_rife_session(provider)?;
+	pub fn new(provider: ProviderSelection, fp16: bool) -> Result<Self> {
+		let session = create_rife_session(provider, fp16)?;
 		Ok(Self { session })
 	}
 
@@ -221,12 +232,16 @@ fn extract_output_f32(output: &ort::value::ValueRef<'_>) -> Result<Array4<f32>> 
 }
 
 /// Create an ORT session for the embedded RIFE model with provider fallback.
-fn create_rife_session(provider: ProviderSelection) -> Result<Session> {
+fn create_rife_session(provider: ProviderSelection, fp16: bool) -> Result<Session> {
 	use ort::session::builder::AutoDevicePolicy;
 	use tracing::warn;
 
-	let commit =
-		|b: &mut ort::session::builder::SessionBuilder| b.commit_from_memory(RIFE_MODEL_BYTES);
+	let model_bytes: &[u8] = if fp16 {
+		RIFE_FP16_MODEL_BYTES
+	} else {
+		RIFE_FP32_MODEL_BYTES
+	};
+	let commit = |b: &mut ort::session::builder::SessionBuilder| b.commit_from_memory(model_bytes);
 
 	// CPU inference: use all available cores for intra-op parallelism.
 	let configure_cpu =

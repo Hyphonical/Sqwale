@@ -22,6 +22,7 @@ pub struct InterpolateArgs {
 	pub ensemble: bool,
 	pub scene_detect: bool,
 	pub scene_threshold: f64,
+	pub fp16: bool,
 }
 
 /// Run the interpolate command.
@@ -32,6 +33,7 @@ pub fn run(input: &str, output_arg: Option<&str>, ia: InterpolateArgs, args: &Cl
 		ensemble,
 		scene_detect,
 		scene_threshold,
+		fp16,
 	} = ia;
 	// Validate input file exists.
 	let input_path = Path::new(input);
@@ -110,7 +112,12 @@ pub fn run(input: &str, output_arg: Option<&str>, ia: InterpolateArgs, args: &Cl
 		SYM_DOT.dimmed(),
 		"Config".dimmed(),
 		config_summary,
-		format!("RIFE 4.25 via {}", provider.name()).dimmed(),
+		format!(
+			"RIFE 4.25 ({}) via {}",
+			if fp16 { "fp16" } else { "fp32" },
+			provider.name()
+		)
+		.dimmed(),
 	);
 
 	// Probe input for metadata.
@@ -135,7 +142,7 @@ pub fn run(input: &str, output_arg: Option<&str>, ia: InterpolateArgs, args: &Cl
 	);
 
 	// Load RIFE model with spinner.
-	let mut rife = with_spinner("Loading RIFE model…", || RifeSession::new(provider))
+	let mut rife = with_spinner("Loading RIFE model…", || RifeSession::new(provider, fp16))
 		.context("Failed to load RIFE model")?;
 
 	let start = Instant::now();

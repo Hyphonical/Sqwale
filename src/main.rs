@@ -31,8 +31,9 @@ fn main() -> Result<()> {
 			input,
 			model,
 			output,
+			grain,
 		} => {
-			cli::upscale::run(input, model.as_deref(), output.as_deref(), &args)?;
+			cli::upscale::run(input, model.as_deref(), output.as_deref(), *grain, &args)?;
 		}
 		cli::Commands::Interpolate {
 			input,
@@ -42,6 +43,7 @@ fn main() -> Result<()> {
 			ensemble,
 			scene_detect,
 			scene_threshold,
+			fp16,
 		} => {
 			cli::interpolate::run(
 				input,
@@ -52,6 +54,7 @@ fn main() -> Result<()> {
 					ensemble: *ensemble,
 					scene_detect: *scene_detect,
 					scene_threshold: *scene_threshold,
+					fp16: *fp16,
 				},
 				&args,
 			)?;

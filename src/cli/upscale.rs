@@ -23,6 +23,7 @@ pub fn run(
 	input_pattern: &str,
 	model_path: Option<&str>,
 	output_arg: Option<&str>,
+	grain: u8,
 	args: &Cli,
 ) -> Result<()> {
 	// Resolve input files.
@@ -111,6 +112,7 @@ pub fn run(
 			tile_size,
 			tile_overlap,
 			blend,
+			grain,
 			show_progress,
 			&cancel,
 		)
@@ -124,6 +126,7 @@ pub fn run(
 			tile_size,
 			tile_overlap,
 			blend,
+			grain,
 			show_progress,
 			&cancel,
 		)
@@ -141,6 +144,7 @@ fn run_single(
 	tile_size: u32,
 	tile_overlap: u32,
 	blend: f32,
+	grain: u8,
 	show_progress: bool,
 	cancel: &CancelToken,
 ) -> Result<()> {
@@ -279,7 +283,7 @@ fn run_single(
 		"Output".dimmed(),
 		dims_str(out_w, out_h),
 	);
-
+	let output_img = apply_grain(output_img, grain);
 	imageio::save_image(&output_img, &output_path)?;
 
 	println!(
@@ -318,6 +322,7 @@ fn run_batch(
 	tile_size: u32,
 	tile_overlap: u32,
 	blend: f32,
+	grain: u8,
 	show_progress: bool,
 	cancel: &CancelToken,
 ) -> Result<()> {
@@ -517,6 +522,7 @@ fn run_batch(
 			tile_size,
 			tile_overlap,
 			blend,
+			grain,
 			cancel,
 			tile_pb.as_ref(),
 			&multi,
@@ -649,6 +655,7 @@ fn process_single_image(
 	tile_size: u32,
 	tile_overlap: u32,
 	blend: f32,
+	grain: u8,
 	cancel: &CancelToken,
 	tile_pb: Option<&ProgressBar>,
 	multi: &Option<MultiProgress>,
@@ -735,6 +742,7 @@ fn process_single_image(
 		dims_str(out_w, out_h)
 	));
 
+	let output_img = apply_grain(output_img, grain);
 	imageio::save_image(&output_img, output_path)?;
 
 	print_line(format!(
@@ -816,4 +824,59 @@ fn resolve_batch_output(input: &Path, output_dir: Option<&Path>, scale: u32) -> 
 			Ok(dir.join(name))
 		}
 	}
+}
+
+// ── Post-processing ────────────────────────────────────────────────────────
+
+/// Apply monochrome Gaussian film grain to an image.
+///
+/// `strength` is the noise standard deviation in 8-bit units (0–100).
+/// The same noise value is added to all RGB channels so the grain is
+/// achromatic (luma-only). `strength = 0` is a no-op.
+fn apply_grain(img: DynamicImage, strength: u8) -> DynamicImage {
+	if strength == 0 {
+		return img;
+	}
+	let sigma = strength as f32;
+	match img {
+		DynamicImage::ImageRgb8(mut rgb) => {
+			for pixel in rgb.pixels_mut() {
+				let n = gaussian_noise(sigma);
+				pixel[0] = (pixel[0] as i16 + n).clamp(0, 255) as u8;
+				pixel[1] = (pixel[1] as i16 + n).clamp(0, 255) as u8;
+				pixel[2] = (pixel[2] as i16 + n).clamp(0, 255) as u8;
+			}
+			DynamicImage::ImageRgb8(rgb)
+		}
+		DynamicImage::ImageRgba8(mut rgba) => {
+			for pixel in rgba.pixels_mut() {
+				let n = gaussian_noise(sigma);
+				pixel[0] = (pixel[0] as i16 + n).clamp(0, 255) as u8;
+				pixel[1] = (pixel[1] as i16 + n).clamp(0, 255) as u8;
+				pixel[2] = (pixel[2] as i16 + n).clamp(0, 255) as u8;
+				// alpha channel unchanged
+			}
+			DynamicImage::ImageRgba8(rgba)
+		}
+		other => {
+			let mut rgb = other.into_rgb8();
+			for pixel in rgb.pixels_mut() {
+				let n = gaussian_noise(sigma);
+				pixel[0] = (pixel[0] as i16 + n).clamp(0, 255) as u8;
+				pixel[1] = (pixel[1] as i16 + n).clamp(0, 255) as u8;
+				pixel[2] = (pixel[2] as i16 + n).clamp(0, 255) as u8;
+			}
+			DynamicImage::ImageRgb8(rgb)
+		}
+	}
+}
+
+/// Sample a single Gaussian random value with the given standard deviation
+/// using the Box-Muller transform. Returns a rounded integer for direct
+/// pixel arithmetic.
+fn gaussian_noise(sigma: f32) -> i16 {
+	let u1 = rand::random::<f32>().max(f32::EPSILON);
+	let u2 = rand::random::<f32>();
+	let z = (-2.0 * u1.ln()).sqrt() * (std::f32::consts::TAU * u2).cos();
+	(z * sigma).round() as i16
 }
