@@ -20,6 +20,17 @@ use crate::pipeline::CancelToken;
 
 pub use rife::RifeSession;
 
+/// Task sent from the inference thread to the FFmpeg writer thread.
+///
+/// Keeping this as an enum lets the writer thread perform `tensor_to_bytes`
+/// conversion concurrently with the next GPU inference call.
+enum WriteTask {
+	/// Raw RGB24 bytes — passed through without conversion (input frame).
+	Raw(Vec<u8>),
+	/// Interpolated f32 tensor — the writer thread converts it to bytes.
+	Tensor(Array4<f32>),
+}
+
 /// Options controlling the interpolation pipeline.
 pub struct InterpolateOptions {
 	/// Frame rate multiplier (must be a power of two ≥ 2).
@@ -98,14 +109,21 @@ pub fn run(
 		options.crf,
 	)?;
 
-	// Bounded channels decouple FFmpeg I/O from inference.
-	// Reader → Inference: up to 10 raw frames buffered.
-	let (read_tx, read_rx) = bounded::<Vec<u8>>(10);
-	// Inference → Writer: up to 20 output frames buffered.
-	let (write_tx, write_rx) = bounded::<Vec<u8>>(20);
+	// Three-stage pipeline decouples I/O, CPU conversion, and GPU inference:
+	//
+	//  FFmpeg reader ──[read_rx]──► Prep thread (bytes→tensor)
+	//                ──[prep_rx]──► Main thread (GPU inference)
+	//                ──[write_tx]──► Writer thread (tensor→bytes + FFmpeg stdin)
+	//
+	// Channel sizing: read buffer is generous so FFmpeg is never stalled;
+	// prep buffer is small because each entry holds a full tensor (~25 MB);
+	// write buffer matches a few frame-pairs worth of output.
+	let (read_tx, read_rx) = bounded::<Vec<u8>>(8);
+	let (prep_tx, prep_rx) = bounded::<(Vec<u8>, Array4<f32>)>(4);
+	let (write_tx, write_rx) = bounded::<WriteTask>(16);
 
 	// Reader thread: continuously reads raw RGB24 frames from FFmpeg stdout
-	// and forwards them into the inference channel.
+	// and forwards them into the prep channel.
 	let reader_handle = thread::spawn(move || -> Result<()> {
 		let mut reader = BufReader::new(reader_stdout);
 		loop {
@@ -113,7 +131,7 @@ pub fn run(
 			match ffmpeg::read_frame(&mut reader, &mut frame) {
 				Ok(true) => {
 					if read_tx.send(frame).is_err() {
-						// Inference thread dropped the receiver; stop reading.
+						// Prep thread dropped the receiver; stop reading.
 						break;
 					}
 				}
@@ -124,13 +142,30 @@ pub fn run(
 		Ok(())
 	});
 
-	// Writer thread: receives output frames from the inference channel and
-	// writes them sequentially to FFmpeg stdin.
+	// Prep thread: converts raw bytes to f32 tensors so that tensor conversion
+	// overlaps with GPU inference on the main thread.
+	let (prep_w, prep_h) = (info.width, info.height);
+	let prep_handle = thread::spawn(move || {
+		for buf in read_rx {
+			let tensor = rife::bytes_to_tensor(&buf, prep_w, prep_h);
+			if prep_tx.send((buf, tensor)).is_err() {
+				break;
+			}
+		}
+	});
+
+	// Writer thread: converts interpolated tensors to bytes and writes them to
+	// FFmpeg stdin. Running tensor_to_bytes here overlaps post-processing with
+	// the next GPU inference call on the main thread.
 	let writer_handle = thread::spawn(move || -> Result<()> {
 		let mut writer = BufWriter::new(writer_stdin);
-		for frame in write_rx {
+		for task in write_rx {
+			let bytes = match task {
+				WriteTask::Raw(b) => b,
+				WriteTask::Tensor(t) => rife::tensor_to_bytes(&t),
+			};
 			writer
-				.write_all(&frame)
+				.write_all(&bytes)
 				.map_err(|e| anyhow::anyhow!("Failed to write frame to FFmpeg: {e}"))?;
 		}
 		writer
@@ -139,16 +174,17 @@ pub fn run(
 	});
 
 	// ── Inference (Main Thread) ────────────────────────────────────────────
-	// Inference is strictly sequential to preserve frame order; only I/O is
-	// decoupled into the reader/writer threads above.
+	// Inference is strictly sequential to preserve frame order.
+	// CPU work (bytes↔tensor conversion) is overlapped by the prep and writer
+	// threads so the GPU is kept as busy as possible.
 
 	let mut frames_written: usize = 0;
 	let mut frames_read: usize = 0;
 	let mut inference_result: Result<()> = Ok(());
 
-	// Receive the first frame; if none arrives the input is empty.
-	if let Ok(buf_a) = read_rx.recv() {
-		let mut tensor_a = rife::bytes_to_tensor(&buf_a, info.width, info.height);
+	// Receive the first pre-converted frame from the prep thread.
+	if let Ok((buf_a, tensor_a_init)) = prep_rx.recv() {
+		let mut tensor_a = tensor_a_init;
 		frames_read = 1;
 
 		// Log padding info once (it’s constant for all frames).
@@ -169,7 +205,7 @@ pub fn run(
 		let mut prev_buf: Option<Vec<u8>> = options.scene_detect_threshold.map(|_| buf_a.clone());
 
 		// Pass the first frame through to the writer unchanged.
-		if write_tx.send(buf_a).is_ok() {
+		if write_tx.send(WriteTask::Raw(buf_a)).is_ok() {
 			frames_written += 1;
 			report_progress(&options.on_progress, frames_written, total_output_frames);
 		} else {
@@ -183,17 +219,13 @@ pub fn run(
 				break;
 			}
 
-			let wait_read_start = Instant::now();
-			let buf_b = match read_rx.recv() {
+			let wait_prep_start = Instant::now();
+			let (buf_b, tensor_b) = match prep_rx.recv() {
 				Ok(frame) => frame,
 				Err(_) => break, // EOF: no more input frames.
 			};
-			let wait_read_time = wait_read_start.elapsed();
+			let wait_prep_time = wait_prep_start.elapsed();
 			frames_read += 1;
-
-			let conv_start = Instant::now();
-			let tensor_b = rife::bytes_to_tensor(&buf_b, info.width, info.height);
-			let conv_time = conv_start.elapsed();
 
 			let infer_start = Instant::now();
 
@@ -221,7 +253,7 @@ pub fn run(
 				{
 					let dup = prev_buf.as_ref().unwrap();
 					for _ in 0..(options.multiplier - 1) {
-						if write_tx.send(dup.clone()).is_err() {
+						if write_tx.send(WriteTask::Raw(dup.clone())).is_err() {
 							inference_result =
 								Err(anyhow::anyhow!("Writer channel closed unexpectedly"));
 							break 'outer;
@@ -247,9 +279,8 @@ pub fn run(
 					}
 				};
 
-				for mid in &mids {
-					let bytes = rife::tensor_to_bytes(mid);
-					if write_tx.send(bytes).is_err() {
+				for mid in mids {
+					if write_tx.send(WriteTask::Tensor(mid)).is_err() {
 						inference_result =
 							Err(anyhow::anyhow!("Writer channel closed unexpectedly"));
 						break 'outer;
@@ -264,31 +295,32 @@ pub fn run(
 			}
 
 			// Send frame B and slide the window.
-			if write_tx.send(buf_b).is_err() {
+			if write_tx.send(WriteTask::Raw(buf_b)).is_err() {
 				inference_result = Err(anyhow::anyhow!("Writer channel closed unexpectedly"));
 				break;
 			}
 			frames_written += 1;
 			report_progress(&options.on_progress, frames_written, total_output_frames);
 
-			let infer_write_time = infer_start.elapsed();
+			let infer_time = infer_start.elapsed();
 			debug!(
-				"✦ Wait Read: {:.3} ms | Conv In: {:.3} ms | Infer+Write: {:.3} ms",
-				wait_read_time.as_secs_f64() * 1_000.0,
-				conv_time.as_secs_f64() * 1_000.0,
-				infer_write_time.as_secs_f64() * 1_000.0
+				"✦ Prep Wait: {:.1}ms | Infer: {:.1}ms | (tensor→bytes async in writer)",
+				wait_prep_time.as_secs_f64() * 1_000.0,
+				infer_time.as_secs_f64() * 1_000.0,
 			);
 
 			tensor_a = tensor_b;
 		}
 	}
 
-	// Drop channel endpoints: signals the reader to stop sending and the
-	// writer to flush once its queue is drained.
+	// Drop channel endpoints: closing write_tx drains the writer; closing
+	// prep_rx signals the prep thread to stop (it will drain read_rx and exit,
+	// which in turn causes the reader thread to stop sending).
 	drop(write_tx);
-	drop(read_rx);
+	drop(prep_rx);
 
 	// Join threads and collect any errors they encountered.
+	prep_handle.join().expect("prep thread panicked");
 	let reader_result = reader_handle.join().expect("reader thread panicked");
 	let writer_result = writer_handle.join().expect("writer thread panicked");
 
@@ -384,14 +416,18 @@ fn recursive_interp(
 	let left_divs = divisions / 2;
 	let right_divs = divisions - left_divs;
 
-	// Left half: frames between f0 and mid.
-	recursive_interp(rife, f0, &mid, t0, mid_t, left_divs, ensemble, out)?;
+	// Collect subtrees into temporary buffers so `mid` can be *moved* into
+	// `out` rather than cloned. Each Array4 can be tens of MB, so skipping
+	// the clone is meaningful for 4× and above.
+	let mut left = Vec::new();
+	recursive_interp(rife, f0, &mid, t0, mid_t, left_divs, ensemble, &mut left)?;
+	let mut right = Vec::new();
+	recursive_interp(rife, &mid, f1, mid_t, t1, right_divs, ensemble, &mut right)?;
 
-	// The midpoint frame itself.
-	out.push(mid.clone());
-
-	// Right half: frames between mid and f1.
-	recursive_interp(rife, &mid, f1, mid_t, t1, right_divs, ensemble, out)?;
+	// Assemble in chronological order: left ‥ mid ‥ right.
+	out.extend(left);
+	out.push(mid);
+	out.extend(right);
 
 	Ok(())
 }

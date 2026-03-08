@@ -228,17 +228,29 @@ fn create_rife_session(provider: ProviderSelection) -> Result<Session> {
 	let commit =
 		|b: &mut ort::session::builder::SessionBuilder| b.commit_from_memory(RIFE_MODEL_BYTES);
 
-	let configure = |b: ort::session::builder::SessionBuilder| -> Result<ort::session::builder::SessionBuilder> {
-		b
-			.with_optimization_level(ort::session::builder::GraphOptimizationLevel::Level3)
-			.map_err(|e| anyhow::anyhow!("Failed to set optimization level: {e}"))?
-			.with_intra_threads(std::thread::available_parallelism().map_or(4, |n| n.get()))
-			.map_err(|e| anyhow::anyhow!("Failed to set thread count: {e}"))
-	};
+	// CPU inference: use all available cores for intra-op parallelism.
+	let configure_cpu =
+		|b: ort::session::builder::SessionBuilder| -> Result<ort::session::builder::SessionBuilder> {
+			b.with_optimization_level(ort::session::builder::GraphOptimizationLevel::Level3)
+				.map_err(|e| anyhow::anyhow!("Failed to set optimization level: {e}"))?
+				.with_intra_threads(
+					std::thread::available_parallelism().map_or(4, |n| n.get()),
+				)
+				.map_err(|e| anyhow::anyhow!("Failed to set thread count: {e}"))
+		};
+
+	// GPU inference: do not override ORT's default CPU thread count (1).
+	// Forcing many intra-op threads on a GPU session competes with Rayon's
+	// pool on the CPU side without benefiting GPU throughput.
+	let configure_gpu =
+		|b: ort::session::builder::SessionBuilder| -> Result<ort::session::builder::SessionBuilder> {
+			b.with_optimization_level(ort::session::builder::GraphOptimizationLevel::Level3)
+				.map_err(|e| anyhow::anyhow!("Failed to set optimization level: {e}"))
+		};
 
 	match provider {
 		ProviderSelection::Auto => {
-			let mut builder = configure(
+			let mut builder = configure_gpu(
 				Session::builder()
 					.map_err(|e| anyhow::anyhow!("Failed to create session builder: {e}"))?
 					.with_auto_device(AutoDevicePolicy::MaxPerformance)
@@ -249,7 +261,7 @@ fn create_rife_session(provider: ProviderSelection) -> Result<Session> {
 		}
 		ProviderSelection::Cpu => {
 			let ep = make_ep(ProviderSelection::Cpu)?;
-			let mut builder = configure(
+			let mut builder = configure_cpu(
 				Session::builder()
 					.map_err(|e| anyhow::anyhow!("Failed to create session builder: {e}"))?
 					.with_execution_providers([ep])
@@ -263,7 +275,7 @@ fn create_rife_session(provider: ProviderSelection) -> Result<Session> {
 			let try_result = Session::builder()
 				.map_err(|e| e.to_string())
 				.and_then(|b| b.with_execution_providers([ep]).map_err(|e| e.to_string()))
-				.and_then(|b| configure(b).map_err(|e| e.to_string()))
+				.and_then(|b| configure_gpu(b).map_err(|e| e.to_string()))
 				.and_then(|mut b| commit(&mut b).map_err(|e| e.to_string()));
 
 			match try_result {
@@ -275,7 +287,7 @@ fn create_rife_session(provider: ProviderSelection) -> Result<Session> {
 						e
 					);
 					let ep = make_ep(ProviderSelection::Cpu)?;
-					let mut builder = configure(
+					let mut builder = configure_cpu(
 						Session::builder()
 							.map_err(|e| anyhow::anyhow!("Failed to create session builder: {e}"))?
 							.with_execution_providers([ep])
