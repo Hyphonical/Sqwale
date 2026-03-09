@@ -51,18 +51,6 @@ pub struct InterpolateOptions {
 	/// default for hard scene cuts.
 	pub scene_detect_threshold: Option<f64>,
 
-	/// Source input frame index to start decoding from. Set to `> 0` when resuming
-	/// an interrupted run to skip already-processed input frames.
-	pub start_frame: usize,
-
-	/// Number of output frames already written in a previous run. Used to offset
-	/// progress reporting so the bar reflects total progress.
-	pub output_frame_offset: usize,
-
-	/// When `Some`, all output PTS values are shifted by this many seconds.
-	/// Used for continuation segments that will be concatenated later.
-	pub ts_offset_secs: Option<f64>,
-
 	/// Cooperative cancellation token.
 	pub cancel: CancelToken,
 
@@ -111,15 +99,9 @@ pub fn run(
 	);
 
 	// Spawn FFmpeg processes.
-	let (mut reader_child, reader_stdout) = ffmpeg::spawn_reader_from(input, options.start_frame)?;
-	let (mut writer_child, writer_stdin) = ffmpeg::spawn_writer(
-		output,
-		info.width,
-		info.height,
-		&out_fps_str,
-		options.crf,
-		options.ts_offset_secs,
-	)?;
+	let (mut reader_child, reader_stdout) = ffmpeg::spawn_reader(input)?;
+	let (mut writer_child, writer_stdin) =
+		ffmpeg::spawn_writer(output, info.width, info.height, &out_fps_str, options.crf)?;
 
 	// Three-stage pipeline decouples I/O, CPU conversion, and GPU inference:
 	//
@@ -219,11 +201,7 @@ pub fn run(
 		// Pass the first frame through to the writer unchanged.
 		if write_tx.send(WriteTask::Raw(buf_a)).is_ok() {
 			frames_written += 1;
-			report_progress(
-				&options.on_progress,
-				frames_written + options.output_frame_offset,
-				total_output_frames,
-			);
+			report_progress(&options.on_progress, frames_written, total_output_frames);
 		} else {
 			inference_result = Err(anyhow::anyhow!("Writer channel closed unexpectedly"));
 		}
@@ -279,11 +257,7 @@ pub fn run(
 							break 'outer;
 						}
 						frames_written += 1;
-						report_progress(
-							&options.on_progress,
-							frames_written + options.output_frame_offset,
-							total_output_frames,
-						);
+						report_progress(&options.on_progress, frames_written, total_output_frames);
 					}
 				}
 				*prev_buf.as_mut().unwrap() = buf_b.clone();
@@ -310,11 +284,7 @@ pub fn run(
 						break 'outer;
 					}
 					frames_written += 1;
-					report_progress(
-						&options.on_progress,
-						frames_written + options.output_frame_offset,
-						total_output_frames,
-					);
+					report_progress(&options.on_progress, frames_written, total_output_frames);
 				}
 
 				if let Some(ref mut pb) = prev_buf {
@@ -328,11 +298,7 @@ pub fn run(
 				break;
 			}
 			frames_written += 1;
-			report_progress(
-				&options.on_progress,
-				frames_written + options.output_frame_offset,
-				total_output_frames,
-			);
+			report_progress(&options.on_progress, frames_written, total_output_frames);
 
 			let infer_time = infer_start.elapsed();
 			debug!(

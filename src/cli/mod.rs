@@ -103,8 +103,8 @@ pub enum Commands {
 		/// Input video file path.
 		input: String,
 
-		/// Output video file path (always .ts).
-		/// Omit to write next to the input as `{stem}_{multiplier}x.ts`.
+		/// Output video file path (always .mkv).
+		/// Omit to write next to the input as `{stem}_{multiplier}x.mkv`.
 		#[arg(short, long)]
 		output: Option<String>,
 
@@ -130,13 +130,5 @@ pub enum Commands {
 		/// Has no effect unless `--scene-detect` is also set.
 		#[arg(long, default_value_t = 0.1, value_parser = parse_scene_threshold)]
 		scene_threshold: f64,
-
-		/// Resume an interrupted interpolation run.
-		///
-		/// Counts the frames already written to the output file, computes the
-		/// last clean source frame boundary, trims any partial pair if needed,
-		/// then continues encoding from where it left off.
-		#[arg(long = "continue")]
-		resume: bool,
 	},
 }

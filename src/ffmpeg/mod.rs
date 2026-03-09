@@ -10,6 +10,15 @@ use std::path::Path;
 use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
 use std::thread;
 
+// On Windows, Ctrl+C is broadcast to all processes sharing the console.
+// Spawning FFmpeg children with CREATE_NEW_PROCESS_GROUP prevents them from
+// receiving the signal, so they can finalize their output containers cleanly
+// when we close their stdin instead of being killed mid-write.
+#[cfg(windows)]
+use std::os::windows::process::CommandExt;
+#[cfg(windows)]
+const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
+
 use tracing::{debug, info, warn};
 
 // ── Video metadata ─────────────────────────────────────────────────────────
@@ -196,6 +205,10 @@ pub fn spawn_reader(input: &Path) -> Result<(Child, ChildStdout)> {
 		cmd.args(["-hwaccel", "cuda"]);
 	}
 
+	// Isolate from Ctrl+C on Windows so FFmpeg can finalise its output cleanly.
+	#[cfg(windows)]
+	cmd.creation_flags(CREATE_NEW_PROCESS_GROUP);
+
 	let mut child = cmd
 		.args(["-i", input_str])
 		.args(["-f", "rawvideo"])
@@ -221,23 +234,16 @@ pub fn spawn_reader(input: &Path) -> Result<(Child, ChildStdout)> {
 	Ok((child, stdout))
 }
 
-/// Spawn an FFmpeg process that reads raw RGB24 frames from stdin and encodes to MPEG-TS.
+/// Spawn an FFmpeg process that reads raw RGB24 frames from stdin and encodes to MKV.
 ///
 /// Audio is intentionally omitted — call [`mux_audio_into`] after the run completes
 /// to add the source audio in a single lossless remux pass.
-///
-/// B-frames are disabled (`-bf 0`) so that any partial `.ts` can be resumed cleanly.
-///
-/// When `ts_offset_secs` is `Some`, all output timestamps are shifted forward by
-/// that amount. This is used when encoding a continuation segment that will later
-/// be concatenated with the existing output via [`concat_ts`].
 pub fn spawn_writer(
 	output: &Path,
 	width: usize,
 	height: usize,
 	output_fps_str: &str,
 	crf: u32,
-	ts_offset_secs: Option<f64>,
 ) -> Result<(Child, ChildStdin)> {
 	let output_str = output
 		.to_str()
@@ -262,10 +268,8 @@ pub fn spawn_writer(
 		cmd.args(["-c:v", "hevc_nvenc"]).args(["-preset", "p4"]);
 
 		if crf == 0 {
-			// NVENC requires a specific tune flag for true lossless.
 			cmd.args(["-tune", "lossless"]);
 		} else {
-			// VBR rate control: -cq is respected only when -b:v 0 removes the bitrate cap.
 			cmd.args(["-rc", "vbr"])
 				.args(["-cq", &crf.to_string()])
 				.args(["-b:v", "0"]);
@@ -277,16 +281,12 @@ pub fn spawn_writer(
 			.args(["-crf", &crf.to_string()]);
 	}
 
-	// Disable B-frames so any partial .ts can be resumed without GOP misalignment.
-	cmd.args(["-bf", "0"]);
-
-	// Apply PTS offset for continuation segments.
-	if let Some(offset) = ts_offset_secs {
-		cmd.args(["-output_ts_offset", &format!("{offset:.6}")]);
-	}
+	// Isolate from Ctrl+C on Windows so FFmpeg can finalise the MKV container cleanly.
+	#[cfg(windows)]
+	cmd.creation_flags(CREATE_NEW_PROCESS_GROUP);
 
 	let mut child = cmd
-		.args(["-f", "mpegts"])
+		.args(["-f", "matroska"])
 		.args(["-v", "quiet"])
 		.arg(output_str)
 		.stdin(Stdio::piped())
@@ -306,73 +306,18 @@ pub fn spawn_writer(
 	pipe_stderr_to_debug!(&mut child, "ffmpeg::writer");
 
 	debug!(
-		"FFmpeg writer spawned: {}×{} @ {} fps, CRF {}, ts_offset={:?}, output {:?}",
-		width, height, output_fps_str, crf, ts_offset_secs, output
+		"FFmpeg writer spawned: {}×{} @ {} fps, CRF {}, output {:?}",
+		width, height, output_fps_str, crf, output
 	);
 	Ok((child, stdin))
 }
 
-/// Spawn an FFmpeg reader that begins decoding from `start_frame`, discarding all
-/// preceding frames via a `select` filter.
-///
-/// When `start_frame == 0` this is equivalent to [`spawn_reader`].
-///
-/// # Performance note
-/// All frames before `start_frame` are decoded (but not output). For very long
-/// videos with a late resume point this may take some time. A future optimisation
-/// would combine `-ss` fast-seek with a small sub-GOP `select` offset.
-pub fn spawn_reader_from(input: &Path, start_frame: usize) -> Result<(Child, ChildStdout)> {
-	if start_frame == 0 {
-		return spawn_reader(input);
-	}
-
-	let input_str = input
-		.to_str()
-		.context("Input path contains invalid UTF-8")?;
-
-	let mut cmd = Command::new("ffmpeg");
-
-	// CUDA hwaccel: frames are on CPU after decode, so the software `select` filter works.
-	if supports_nvenc() {
-		cmd.args(["-hwaccel", "cuda"]);
-	}
-
-	let select_expr = format!("select=gte(n\\,{start_frame})");
-	let mut child = cmd
-		.args(["-i", input_str])
-		.args(["-vf", &select_expr])
-		.args(["-f", "rawvideo"])
-		.args(["-pix_fmt", "rgb24"])
-		.args(["-v", "quiet"])
-		.arg("-")
-		.stdout(Stdio::piped())
-		.stderr(Stdio::piped())
-		.spawn()
-		.context(
-			"Failed to spawn FFmpeg reader. Is FFmpeg installed and on your PATH?\n\
-			 Download from: https://ffmpeg.org/download.html",
-		)?;
-
-	let stdout = child
-		.stdout
-		.take()
-		.context("Failed to capture FFmpeg reader stdout")?;
-
-	pipe_stderr_to_debug!(&mut child, "ffmpeg::reader");
-
-	debug!(
-		"FFmpeg seek-reader spawned for {:?}, start_frame={start_frame}",
-		input
-	);
-	Ok((child, stdout))
-}
-
-/// Mux the audio stream from `source` into `video_only_ts`, writing the combined result
+/// Mux the audio stream from `source` into `video_only`, writing the combined result
 /// to `output`. Uses stream copy (no re-encoding).
 ///
 /// If `source` has no audio stream, the video is copied to `output` unchanged.
-pub fn mux_audio_into(video_ts: &Path, source: &Path, output: &Path) -> Result<()> {
-	let video_str = video_ts
+pub fn mux_audio_into(video: &Path, source: &Path, output: &Path) -> Result<()> {
+	let video_str = video
 		.to_str()
 		.context("Video path contains invalid UTF-8")?;
 	let source_str = source
@@ -389,7 +334,7 @@ pub fn mux_audio_into(video_ts: &Path, source: &Path, output: &Path) -> Result<(
 		.args(["-map", "0:v"])
 		.args(["-map", "1:a?"])
 		.args(["-c", "copy"])
-		.args(["-f", "mpegts"])
+		.args(["-f", "matroska"])
 		.args(["-v", "quiet"])
 		.arg(output_str)
 		.status()
@@ -404,88 +349,12 @@ pub fn mux_audio_into(video_ts: &Path, source: &Path, output: &Path) -> Result<(
 
 	debug!(
 		"Audio mux complete: {:?} + {:?} → {:?}",
-		video_ts, source, output
+		video, source, output
 	);
-	Ok(())
-}
-
-/// Trim an MPEG-TS file to at most `frame_count` video frames, writing to `output`.
-/// Uses stream copy (no re-encoding). The input file is not modified.
-pub fn trim_to_frames(input: &Path, frame_count: usize, output: &Path) -> Result<()> {
-	let input_str = input
-		.to_str()
-		.context("Input path contains invalid UTF-8")?;
-	let output_str = output
-		.to_str()
-		.context("Output path contains invalid UTF-8")?;
-
-	let status = Command::new("ffmpeg")
-		.arg("-y")
-		.args(["-i", input_str])
-		.args(["-map", "0:v"])
-		.args(["-frames:v", &frame_count.to_string()])
-		.args(["-c", "copy"])
-		.args(["-f", "mpegts"])
-		.args(["-v", "quiet"])
-		.arg(output_str)
-		.status()
-		.context("Failed to run FFmpeg trim")?;
-
-	if !status.success() {
-		bail!(
-			"FFmpeg trim exited with status {}",
-			status.code().unwrap_or(-1)
-		);
-	}
-
-	debug!(
-		"Trim complete: {:?} → {frame_count} frames → {:?}",
-		input, output
-	);
-	Ok(())
-}
-
-/// Concatenate two MPEG-TS files into one using FFmpeg's concat protocol.
-///
-/// The concat protocol is designed for transport-stream joining and correctly
-/// handles continuity counters, PAT/PMT tables, and PTS alignment.
-/// Both inputs must share the same codec parameters.
-pub fn concat_ts(first: &Path, second: &Path, output: &Path) -> Result<()> {
-	let first_str = first
-		.to_str()
-		.context("First TS path contains invalid UTF-8")?;
-	let second_str = second
-		.to_str()
-		.context("Second TS path contains invalid UTF-8")?;
-	let output_str = output
-		.to_str()
-		.context("Output path contains invalid UTF-8")?;
-
-	let concat_input = format!("concat:{first_str}|{second_str}");
-
-	let status = Command::new("ffmpeg")
-		.arg("-y")
-		.args(["-i", &concat_input])
-		.args(["-c", "copy"])
-		.args(["-f", "mpegts"])
-		.args(["-v", "quiet"])
-		.arg(output_str)
-		.status()
-		.context("Failed to run FFmpeg concat")?;
-
-	if !status.success() {
-		bail!(
-			"FFmpeg concat exited with status {}",
-			status.code().unwrap_or(-1)
-		);
-	}
-
-	debug!("Concat complete: {:?} + {:?} → {:?}", first, second, output);
 	Ok(())
 }
 
 /// Multiply a rational FPS string by an integer multiplier.
-///
 /// `"24000/1001"` × 2 → `"48000/1001"`.
 /// Integer rates like `"30"` are treated as `"30/1"`.
 pub fn multiply_fps(fps_str: &str, multiplier: u32) -> Result<String> {

@@ -23,7 +23,6 @@ pub struct InterpolateArgs {
 	pub ensemble: bool,
 	pub scene_detect: bool,
 	pub scene_threshold: f64,
-	pub resume: bool,
 }
 
 /// Run the interpolate command.
@@ -34,7 +33,6 @@ pub fn run(input: &str, output_arg: Option<&str>, ia: InterpolateArgs, args: &Cl
 		ensemble,
 		scene_detect,
 		scene_threshold,
-		resume,
 	} = ia;
 	// Validate input file exists.
 	let input_path = Path::new(input);
@@ -47,7 +45,7 @@ pub fn run(input: &str, output_arg: Option<&str>, ia: InterpolateArgs, args: &Cl
 		bail!("Multiplier must be a power of two (2, 4, 8, …), got {multiplier}");
 	}
 
-	// Resolve output path (always .ts).
+	// Resolve output path (always .mkv).
 	let output_path = resolve_output(input_path, output_arg, multiplier)?;
 
 	// Parse provider.
@@ -151,82 +149,9 @@ pub fn run(input: &str, output_arg: Option<&str>, ia: InterpolateArgs, args: &Cl
 		0
 	};
 
-	// ── Continue / resume logic ──────────────────────────────────────────
-	// Determine how many frames are already in the output file and compute
-	// the safe resume point (last complete source-frame boundary).
-	let (start_frame, output_frame_offset) = if resume {
-		if output_path.exists() {
-			let out_info = ffmpeg::probe(&output_path)
-				.context("Failed to probe existing output file for --continue")?;
-			let p = out_info.frame_count;
-			let m = multiplier as usize;
-
-			// `clean_p` is the count of output frames that form complete pairs:
-			// clean_p = floor((p − 1) / m) × m + 1
-			let complete_pairs = p.saturating_sub(1) / m;
-			let clean_p = complete_pairs * m + 1;
-
-			// The 0-based source frame that was last used as an A-frame.
-			let source_start = clean_p.saturating_sub(1) / m;
-
-			// Check whether the output is already complete.
-			if source_start >= info.frame_count.saturating_sub(1) {
-				println!(
-					"{} Output already complete ({} frames). Nothing to do.",
-					SYM_CHECK.green(),
-					p
-				);
-				return Ok(());
-			}
-
-			// Trim any partial pair so the append point is clean.
-			if p != clean_p {
-				println!(
-					"{}  Trimming partial pair: {} → {} frames",
-					SYM_DOT.dimmed(),
-					p,
-					clean_p
-				);
-				let tmp = output_path.with_extension("ts.trim");
-				ffmpeg::trim_to_frames(&output_path, clean_p, &tmp)
-					.context("Failed to trim output to clean frame boundary")?;
-				std::fs::rename(&tmp, &output_path)
-					.context("Failed to replace output with trimmed file")?;
-			}
-
-			println!(
-				"{}  Resuming from source frame {} (output frame {}/{})",
-				SYM_DOT.dimmed(),
-				source_start,
-				clean_p,
-				total_output_frames
-			);
-
-			(source_start, clean_p)
-		} else {
-			println!(
-				"{}  No existing output found — starting fresh.",
-				SYM_DOT.dimmed()
-			);
-			(0, 0)
-		}
-	} else {
-		(0, 0)
-	};
-
-	// When continuing, write to a temp file so we can properly concatenate later.
-	let (write_target, ts_offset_secs) = if output_frame_offset > 0 {
-		let temp = output_path.with_extension("ts.cont");
-		let offset = output_frame_offset as f64 / (info.fps * multiplier as f64);
-		(temp, Some(offset))
-	} else {
-		(output_path.clone(), None)
-	};
-
 	let pb = if show_progress {
 		let pb = ProgressBar::new(total_output_frames as u64).with_style(interp_bar_style());
 		pb.enable_steady_tick(Duration::from_millis(SPINNER_TICK_MS));
-		pb.set_position(output_frame_offset as u64);
 		Some(pb)
 	} else {
 		None
@@ -238,9 +163,6 @@ pub fn run(input: &str, output_arg: Option<&str>, ia: InterpolateArgs, args: &Cl
 		ensemble,
 		crf,
 		scene_detect_threshold: scene_detect.then_some(scene_threshold),
-		start_frame,
-		output_frame_offset,
-		ts_offset_secs,
 		cancel: cancel.clone(),
 		on_progress: Some(Box::new(move |done, total| {
 			if let Some(ref pb) = pb_clone {
@@ -250,7 +172,7 @@ pub fn run(input: &str, output_arg: Option<&str>, ia: InterpolateArgs, args: &Cl
 		})),
 	};
 
-	let result = interpolate::run(input_path, &write_target, &mut rife, &options);
+	let result = interpolate::run(input_path, &output_path, &mut rife, &options);
 
 	if let Some(ref pb) = pb {
 		pb.finish_and_clear();
@@ -262,22 +184,10 @@ pub fn run(input: &str, output_arg: Option<&str>, ia: InterpolateArgs, args: &Cl
 	let result = result?;
 	let elapsed = start.elapsed();
 
-	// ── Post-run: concatenate continuation segment ────────────────────────
-	// The continuation was written to a separate .ts file with shifted PTS.
-	// Use FFmpeg's concat protocol to merge it cleanly with the existing output.
-	if output_frame_offset > 0 {
-		let merged = output_path.with_extension("ts.merged");
-		ffmpeg::concat_ts(&output_path, &write_target, &merged)
-			.context("Failed to concatenate continuation segment")?;
-		std::fs::rename(&merged, &output_path)
-			.context("Failed to replace output with merged file")?;
-		std::fs::remove_file(&write_target).ok(); // clean up temp
-	}
-
 	// ── Post-run audio mux ───────────────────────────────────────────────
 	// The writer never copies audio; do a single lossless remux pass now.
 	if info.has_audio {
-		let muxed = output_path.with_extension("ts.audio");
+		let muxed = output_path.with_extension("mkv.audio");
 		ffmpeg::mux_audio_into(&output_path, input_path, &muxed)
 			.context("Failed to mux audio into output")?;
 		std::fs::rename(&muxed, &output_path)
@@ -298,7 +208,8 @@ pub fn run(input: &str, output_arg: Option<&str>, ia: InterpolateArgs, args: &Cl
 		),
 		format_args!(
 			"{} frames",
-			(result.frames_written + output_frame_offset)
+			result
+				.frames_written
 				.to_string()
 				.truecolor(CLR_VALUE.0, CLR_VALUE.1, CLR_VALUE.2)
 		),
@@ -316,26 +227,26 @@ pub fn run(input: &str, output_arg: Option<&str>, ia: InterpolateArgs, args: &Cl
 
 // ── Helpers ────────────────────────────────────────────────────────────────
 
-/// Resolve the output path, forcing `.ts` extension.
+/// Resolve the output path, forcing `.mkv` extension.
 fn resolve_output(input: &Path, output_arg: Option<&str>, multiplier: u32) -> Result<PathBuf> {
 	let path = if let Some(out) = output_arg {
 		let mut p = PathBuf::from(out);
-		if p.extension().is_some_and(|ext| ext != "ts") {
+		if p.extension().is_some_and(|ext| ext != "mkv") {
 			tracing::warn!(
-				"Output extension changed to .ts (was .{})",
+				"Output extension changed to .mkv (was .{})",
 				p.extension().unwrap().to_string_lossy()
 			);
 		}
-		p.set_extension("ts");
+		p.set_extension("mkv");
 		p
 	} else {
-		// Default: {stem}_{multiplier}x.ts
+		// Default: {stem}_{multiplier}x.mkv
 		let stem = input
 			.file_stem()
 			.context("Input has no file stem")?
 			.to_string_lossy();
 		let parent = input.parent().unwrap_or(Path::new("."));
-		parent.join(format!("{stem}_{multiplier}x.ts"))
+		parent.join(format!("{stem}_{multiplier}x.mkv"))
 	};
 
 	Ok(path)
