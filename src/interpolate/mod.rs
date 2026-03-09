@@ -53,14 +53,15 @@ pub struct InterpolateOptions {
 
 	/// Source input frame index to start decoding from. Set to `> 0` when resuming
 	/// an interrupted run to skip already-processed input frames.
-	///
-	/// Must satisfy `start_frame == (output_frame_offset - 1) / multiplier`.
 	pub start_frame: usize,
 
-	/// Number of frames already present in the output file. When `> 0`, the
-	/// pipeline appends to the existing file (MPEG-TS append mode) and reports
-	/// progress starting from this offset.
+	/// Number of output frames already written in a previous run. Used to offset
+	/// progress reporting so the bar reflects total progress.
 	pub output_frame_offset: usize,
+
+	/// When `Some`, all output PTS values are shifted by this many seconds.
+	/// Used for continuation segments that will be concatenated later.
+	pub ts_offset_secs: Option<f64>,
 
 	/// Cooperative cancellation token.
 	pub cancel: CancelToken,
@@ -111,21 +112,14 @@ pub fn run(
 
 	// Spawn FFmpeg processes.
 	let (mut reader_child, reader_stdout) = ffmpeg::spawn_reader_from(input, options.start_frame)?;
-	let (mut writer_child, writer_stdin) = if options.output_frame_offset > 0 {
-		// Append mode: shift output PTS so the new frames continue seamlessly.
-		let ts_offset_secs =
-			options.output_frame_offset as f64 / (info.fps * options.multiplier as f64);
-		ffmpeg::spawn_writer_append(
-			output,
-			info.width,
-			info.height,
-			&out_fps_str,
-			options.crf,
-			ts_offset_secs,
-		)?
-	} else {
-		ffmpeg::spawn_writer(output, info.width, info.height, &out_fps_str, options.crf)?
-	};
+	let (mut writer_child, writer_stdin) = ffmpeg::spawn_writer(
+		output,
+		info.width,
+		info.height,
+		&out_fps_str,
+		options.crf,
+		options.ts_offset_secs,
+	)?;
 
 	// Three-stage pipeline decouples I/O, CPU conversion, and GPU inference:
 	//

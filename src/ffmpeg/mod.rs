@@ -226,97 +226,23 @@ pub fn spawn_reader(input: &Path) -> Result<(Child, ChildStdout)> {
 /// Audio is intentionally omitted — call [`mux_audio_into`] after the run completes
 /// to add the source audio in a single lossless remux pass.
 ///
-/// B-frames are disabled (`-bf 0`) so that any partial `.ts` can be resumed cleanly
-/// via [`spawn_writer_append`].
+/// B-frames are disabled (`-bf 0`) so that any partial `.ts` can be resumed cleanly.
+///
+/// When `ts_offset_secs` is `Some`, all output timestamps are shifted forward by
+/// that amount. This is used when encoding a continuation segment that will later
+/// be concatenated with the existing output via [`concat_ts`].
 pub fn spawn_writer(
 	output: &Path,
 	width: usize,
 	height: usize,
 	output_fps_str: &str,
 	crf: u32,
+	ts_offset_secs: Option<f64>,
 ) -> Result<(Child, ChildStdin)> {
 	let output_str = output
 		.to_str()
 		.context("Output path contains invalid UTF-8")?;
 
-	let (mut child, stdin) =
-		build_writer_child(output_str, width, height, output_fps_str, crf, None)?;
-
-	// Pipe stderr to tracing in a background thread.
-	pipe_stderr_to_debug!(&mut child, "ffmpeg::writer");
-
-	debug!(
-		"FFmpeg writer spawned: {}×{} @ {} fps, CRF {}, output {:?}",
-		width, height, output_fps_str, crf, output
-	);
-	Ok((child, stdin))
-}
-
-/// Spawn an FFmpeg process that reads raw RGB24 frames from stdin and **appends** encoded
-/// MPEG-TS packets to an existing `.ts` file.
-///
-/// All output timestamps are offset by `ts_offset_secs` so the new packets continue
-/// seamlessly from the last frame in the existing file. A background thread forwards
-/// the child's stdout directly to the open file in append mode.
-pub fn spawn_writer_append(
-	append_to: &Path,
-	width: usize,
-	height: usize,
-	output_fps_str: &str,
-	crf: u32,
-	ts_offset_secs: f64,
-) -> Result<(Child, ChildStdin)> {
-	// Build the child writing to pipe:1 (stdout).
-	let (mut child, stdin) = build_writer_child(
-		"pipe:1",
-		width,
-		height,
-		output_fps_str,
-		crf,
-		Some(ts_offset_secs),
-	)?;
-
-	// Capture stdout and forward to the append file in a background thread.
-	let stdout = child
-		.stdout
-		.take()
-		.context("Failed to capture FFmpeg writer stdout for append")?;
-	let append_path = append_to.to_path_buf();
-	thread::spawn(move || {
-		let file = std::fs::OpenOptions::new()
-			.append(true)
-			.open(&append_path)
-			.expect("Cannot open output .ts for appending");
-		let mut src = BufReader::new(stdout);
-		let mut dst = std::io::BufWriter::new(file);
-		if let Err(e) = std::io::copy(&mut src, &mut dst) {
-			warn!(target: "ffmpeg::writer_append", "Append I/O error: {e}");
-		}
-	});
-
-	pipe_stderr_to_debug!(&mut child, "ffmpeg::writer");
-
-	debug!(
-		"FFmpeg append-writer spawned: {}×{} @ {} fps, CRF {}, ts_offset={:.3}s, append→{:?}",
-		width, height, output_fps_str, crf, ts_offset_secs, append_to
-	);
-	Ok((child, stdin))
-}
-
-/// Spawn an FFmpeg process that reads raw RGB24 frames from stdin, starting output
-/// timestamps at `start_frame` decoded from the input at the given seek point,
-/// and writes to a file from `start_frame`'s position.
-/// The raw writer that decodes from start_frame is for `spawn_reader_from`.
-///
-/// Internal helper shared by `spawn_writer` and `spawn_writer_append`.
-fn build_writer_child(
-	output_target: &str,
-	width: usize,
-	height: usize,
-	output_fps_str: &str,
-	crf: u32,
-	ts_offset_secs: Option<f64>,
-) -> Result<(Child, ChildStdin)> {
 	let size_arg = format!("{width}x{height}");
 
 	let mut cmd = Command::new("ffmpeg");
@@ -354,7 +280,7 @@ fn build_writer_child(
 	// Disable B-frames so any partial .ts can be resumed without GOP misalignment.
 	cmd.args(["-bf", "0"]);
 
-	// Apply PTS offset for append / continue mode.
+	// Apply PTS offset for continuation segments.
 	if let Some(offset) = ts_offset_secs {
 		cmd.args(["-output_ts_offset", &format!("{offset:.6}")]);
 	}
@@ -362,13 +288,9 @@ fn build_writer_child(
 	let mut child = cmd
 		.args(["-f", "mpegts"])
 		.args(["-v", "quiet"])
-		.arg(output_target)
+		.arg(output_str)
 		.stdin(Stdio::piped())
-		.stdout(if ts_offset_secs.is_some() {
-			Stdio::piped() // append mode: capture stdout for the forwarding thread
-		} else {
-			Stdio::null()
-		})
+		.stdout(Stdio::null())
 		.stderr(Stdio::piped())
 		.spawn()
 		.context(
@@ -381,6 +303,12 @@ fn build_writer_child(
 		.take()
 		.context("Failed to capture FFmpeg writer stdin")?;
 
+	pipe_stderr_to_debug!(&mut child, "ffmpeg::writer");
+
+	debug!(
+		"FFmpeg writer spawned: {}×{} @ {} fps, CRF {}, ts_offset={:?}, output {:?}",
+		width, height, output_fps_str, crf, ts_offset_secs, output
+	);
 	Ok((child, stdin))
 }
 
@@ -514,6 +442,45 @@ pub fn trim_to_frames(input: &Path, frame_count: usize, output: &Path) -> Result
 		"Trim complete: {:?} → {frame_count} frames → {:?}",
 		input, output
 	);
+	Ok(())
+}
+
+/// Concatenate two MPEG-TS files into one using FFmpeg's concat protocol.
+///
+/// The concat protocol is designed for transport-stream joining and correctly
+/// handles continuity counters, PAT/PMT tables, and PTS alignment.
+/// Both inputs must share the same codec parameters.
+pub fn concat_ts(first: &Path, second: &Path, output: &Path) -> Result<()> {
+	let first_str = first
+		.to_str()
+		.context("First TS path contains invalid UTF-8")?;
+	let second_str = second
+		.to_str()
+		.context("Second TS path contains invalid UTF-8")?;
+	let output_str = output
+		.to_str()
+		.context("Output path contains invalid UTF-8")?;
+
+	let concat_input = format!("concat:{first_str}|{second_str}");
+
+	let status = Command::new("ffmpeg")
+		.arg("-y")
+		.args(["-i", &concat_input])
+		.args(["-c", "copy"])
+		.args(["-f", "mpegts"])
+		.args(["-v", "quiet"])
+		.arg(output_str)
+		.status()
+		.context("Failed to run FFmpeg concat")?;
+
+	if !status.success() {
+		bail!(
+			"FFmpeg concat exited with status {}",
+			status.code().unwrap_or(-1)
+		);
+	}
+
+	debug!("Concat complete: {:?} + {:?} → {:?}", first, second, output);
 	Ok(())
 }
 

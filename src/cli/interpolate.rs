@@ -214,6 +214,15 @@ pub fn run(input: &str, output_arg: Option<&str>, ia: InterpolateArgs, args: &Cl
 		(0, 0)
 	};
 
+	// When continuing, write to a temp file so we can properly concatenate later.
+	let (write_target, ts_offset_secs) = if output_frame_offset > 0 {
+		let temp = output_path.with_extension("ts.cont");
+		let offset = output_frame_offset as f64 / (info.fps * multiplier as f64);
+		(temp, Some(offset))
+	} else {
+		(output_path.clone(), None)
+	};
+
 	let pb = if show_progress {
 		let pb = ProgressBar::new(total_output_frames as u64).with_style(interp_bar_style());
 		pb.enable_steady_tick(Duration::from_millis(SPINNER_TICK_MS));
@@ -231,6 +240,7 @@ pub fn run(input: &str, output_arg: Option<&str>, ia: InterpolateArgs, args: &Cl
 		scene_detect_threshold: scene_detect.then_some(scene_threshold),
 		start_frame,
 		output_frame_offset,
+		ts_offset_secs,
 		cancel: cancel.clone(),
 		on_progress: Some(Box::new(move |done, total| {
 			if let Some(ref pb) = pb_clone {
@@ -240,7 +250,7 @@ pub fn run(input: &str, output_arg: Option<&str>, ia: InterpolateArgs, args: &Cl
 		})),
 	};
 
-	let result = interpolate::run(input_path, &output_path, &mut rife, &options);
+	let result = interpolate::run(input_path, &write_target, &mut rife, &options);
 
 	if let Some(ref pb) = pb {
 		pb.finish_and_clear();
@@ -251,6 +261,18 @@ pub fn run(input: &str, output_arg: Option<&str>, ia: InterpolateArgs, args: &Cl
 
 	let result = result?;
 	let elapsed = start.elapsed();
+
+	// ── Post-run: concatenate continuation segment ────────────────────────
+	// The continuation was written to a separate .ts file with shifted PTS.
+	// Use FFmpeg's concat protocol to merge it cleanly with the existing output.
+	if output_frame_offset > 0 {
+		let merged = output_path.with_extension("ts.merged");
+		ffmpeg::concat_ts(&output_path, &write_target, &merged)
+			.context("Failed to concatenate continuation segment")?;
+		std::fs::rename(&merged, &output_path)
+			.context("Failed to replace output with merged file")?;
+		std::fs::remove_file(&write_target).ok(); // clean up temp
+	}
 
 	// ── Post-run audio mux ───────────────────────────────────────────────
 	// The writer never copies audio; do a single lossless remux pass now.
