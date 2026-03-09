@@ -32,6 +32,14 @@ pub struct Cli {
 	/// the Lanczos upscale of the original supplies global structure and colour.
 	#[arg(long, global = true, default_value_t = 0.0, value_parser = parse_blend)]
 	pub blend: f32,
+
+	/// Force half-precision (fp16) inference for reduced VRAM and faster GPU execution.
+	///
+	/// For upscale models, the input tensor is converted to float16 regardless of
+	/// what the model declares. For RIFE interpolation, the embedded fp16 model
+	/// variant is used. May not work on CPU.
+	#[arg(long, global = true)]
+	pub fp16: bool,
 }
 
 fn parse_blend(s: &str) -> Result<f32, String> {
@@ -96,6 +104,11 @@ pub enum Commands {
 		/// Scale is 0 to 100. (Recommended: 5 for subtle texture, 20 for heavy film grain).
 		#[arg(long, default_value_t = 0, value_parser = parse_grain)]
 		grain: u8,
+
+		/// Video output quality (lower = better quality, larger file).
+		/// Only used when the input is a video file.
+		#[arg(long, default_value_t = 18)]
+		crf: u32,
 	},
 
 	/// Interpolate video frames using RIFE 4.25 (requires FFmpeg).

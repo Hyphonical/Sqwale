@@ -64,6 +64,9 @@ pub struct UpscaleOptions {
 	/// `1.0` — AI supplies fine detail; Lanczos upscale of the original
 	///         supplies global structure (colour, tone, large shapes).
 	pub blend: f32,
+
+	/// Force half-precision (fp16) input regardless of model metadata.
+	pub force_fp16: bool,
 }
 
 impl Default for UpscaleOptions {
@@ -75,15 +78,11 @@ impl Default for UpscaleOptions {
 			on_blend_step: None,
 			cancel: CancelToken::new(),
 			blend: 0.0,
+			force_fp16: false,
 		}
 	}
 }
 
-/// Run inference on a single image, returning the raw AI output.
-///
-/// This performs tiling, tensor conversion, and inference but does **not**
-/// apply frequency-domain blending. Useful when you want to drop the session
-/// (freeing GPU memory) before blending and saving.
 pub fn upscale_raw(
 	ctx: &mut SessionContext,
 	input: &DynamicImage,
@@ -101,6 +100,8 @@ pub fn upscale_raw(
 	)?;
 	let total_tiles = tiles.len();
 
+	let use_fp16 = options.force_fp16 || model_info.needs_fp16_input();
+
 	let mut canvas: Option<Array4<f32>> = None;
 	let mut weight_map: Option<Array2<f32>> = None;
 	let mut actual_scale = model_info.scale;
@@ -110,7 +111,7 @@ pub fn upscale_raw(
 			bail!("Cancelled");
 		}
 
-		let (tile_output, tile_scale) = run_tile(ctx, input, tile, &model_info)?;
+		let (tile_output, tile_scale) = run_tile(ctx, input, tile, &model_info, use_fp16)?;
 
 		if canvas.is_none() {
 			actual_scale = tile_scale;
@@ -191,6 +192,7 @@ fn run_tile(
 	input: &DynamicImage,
 	tile: &Tile,
 	model_info: &ModelInfo,
+	use_fp16: bool,
 ) -> Result<(Array4<f32>, u32)> {
 	let in_channels = model_info.input_channels;
 
@@ -209,7 +211,7 @@ fn run_tile(
 	let in_h = tensor.shape()[2];
 
 	// Run inference — output shape is determined by the model, not by us.
-	let raw_output = if model_info.needs_fp16_input() {
+	let raw_output = if use_fp16 {
 		let f16_tensor = tensor_f32_to_f16(&tensor);
 		let input_value = ort::value::Value::from_array(f16_tensor)
 			.map_err(|e| anyhow::anyhow!("Failed to create ORT value from fp16 tensor: {e}"))?;

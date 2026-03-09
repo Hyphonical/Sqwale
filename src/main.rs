@@ -32,8 +32,16 @@ fn main() -> Result<()> {
 			model,
 			output,
 			grain,
+			crf,
 		} => {
-			cli::upscale::run(input, model.as_deref(), output.as_deref(), *grain, &args)?;
+			cli::upscale::run(
+				input,
+				model.as_deref(),
+				output.as_deref(),
+				*grain,
+				*crf,
+				&args,
+			)?;
 		}
 		cli::Commands::Interpolate {
 			input,

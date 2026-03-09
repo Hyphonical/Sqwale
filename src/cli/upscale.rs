@@ -5,12 +5,14 @@ use colored::Colorize;
 use crossbeam_channel::bounded;
 use image::DynamicImage;
 use indicatif::{MultiProgress, ProgressBar};
+use std::io::{BufReader, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::thread;
 use std::time::{Duration, Instant};
 
+use sqwale::ffmpeg::{self, ContainerFormat};
 use sqwale::imageio;
 use sqwale::pipeline::{CancelToken, UpscaleOptions};
 use sqwale::session;
@@ -24,6 +26,7 @@ pub fn run(
 	model_path: Option<&str>,
 	output_arg: Option<&str>,
 	grain: u8,
+	crf: u32,
 	args: &Cli,
 ) -> Result<()> {
 	// Resolve input files.
@@ -99,6 +102,7 @@ pub fn run(
 		.tile_overlap
 		.unwrap_or(sqwale::config::DEFAULT_TILE_OVERLAP);
 	let blend = args.blend;
+	let fp16 = args.fp16;
 
 	let show_progress = should_show_progress();
 
@@ -113,23 +117,45 @@ pub fn run(
 			tile_overlap,
 			blend,
 			grain,
+			fp16,
 			show_progress,
 			&cancel,
 		)
 	} else {
-		run_single(
-			&inputs[0],
-			output_arg,
-			ctx,
-			scale,
-			&model_filename,
-			tile_size,
-			tile_overlap,
-			blend,
-			grain,
-			show_progress,
-			&cancel,
-		)
+		// For a single file, probe it to see if it's a video.
+		let input = &inputs[0];
+		let is_video = ffmpeg::probe(input).is_ok();
+
+		if is_video {
+			run_video(
+				input,
+				output_arg,
+				ctx,
+				scale,
+				&model_filename,
+				tile_size,
+				tile_overlap,
+				fp16,
+				crf,
+				show_progress,
+				&cancel,
+			)
+		} else {
+			run_single(
+				input,
+				output_arg,
+				ctx,
+				scale,
+				&model_filename,
+				tile_size,
+				tile_overlap,
+				blend,
+				grain,
+				fp16,
+				show_progress,
+				&cancel,
+			)
+		}
 	}
 }
 
@@ -145,6 +171,7 @@ fn run_single(
 	tile_overlap: u32,
 	blend: f32,
 	grain: u8,
+	fp16: bool,
 	show_progress: bool,
 	cancel: &CancelToken,
 ) -> Result<()> {
@@ -209,6 +236,7 @@ fn run_single(
 		tile_size,
 		tile_overlap,
 		blend: 0.0,
+		force_fp16: fp16,
 		cancel: cancel.clone(),
 		on_tile_done: Some(Box::new(move |done, total| {
 			if let Some(ref pb) = pb_clone {
@@ -305,6 +333,336 @@ fn run_single(
 	Ok(())
 }
 
+/// Upscale a video file frame-by-frame using the AI model.
+///
+/// Reads frames from FFmpeg, upscales each one through the tiling pipeline,
+/// and writes to a new video file. Audio is muxed in afterwards via a
+/// lossless remux pass.
+#[allow(clippy::too_many_arguments)]
+fn run_video(
+	input: &Path,
+	output_arg: Option<&str>,
+	mut ctx: sqwale::SessionContext,
+	scale: u32,
+	model_filename: &str,
+	tile_size: u32,
+	tile_overlap: u32,
+	fp16: bool,
+	crf: u32,
+	show_progress: bool,
+	cancel: &CancelToken,
+) -> Result<()> {
+	// Probe video metadata.
+	let info = ffmpeg::probe(input)?;
+	let out_w = info.width * scale as usize;
+	let out_h = info.height * scale as usize;
+
+	// Resolve output path and container format.
+	let (output_path, container) = resolve_video_output(input, output_arg, scale)?;
+
+	// Header.
+	println!(
+		"{} {}",
+		SYM_BULLET.cyan().bold(),
+		path_str(&input.display().to_string())
+	);
+
+	// Model info line.
+	let model_summary = format!(
+		"{}{}{}{}{}{}{}",
+		format!("{scale}x").truecolor(CLR_VALUE.0, CLR_VALUE.1, CLR_VALUE.2),
+		format!(" {SYM_DOT} ").dimmed(),
+		color_space_str(&ctx.model_info.color_space),
+		format!(" {SYM_DOT} ").dimmed(),
+		dtype_str(&ctx.model_info.input_dtype),
+		format!(" {SYM_DOT} ").dimmed(),
+		if ctx.model_info.tile.supported {
+			"dynamic"
+				.truecolor(CLR_VALUE.0, CLR_VALUE.1, CLR_VALUE.2)
+				.to_string()
+		} else {
+			"fixed".yellow().to_string()
+		},
+	);
+	println!(
+		"{}  {} {}  {}",
+		SYM_DOT.dimmed(),
+		"Model".dimmed(),
+		model_summary,
+		format!("{model_filename} via {}", ctx.provider_used.name()).dimmed()
+	);
+
+	// Input info line.
+	println!(
+		"{}  {} {}  {}  {}",
+		SYM_DOT.dimmed(),
+		"Input".dimmed(),
+		dims_str(info.width as u32, info.height as u32),
+		format_args!(
+			"{}{}",
+			format!("{:.2}", info.fps).truecolor(CLR_VALUE.0, CLR_VALUE.1, CLR_VALUE.2),
+			" fps".dimmed()
+		),
+		format_args!(
+			"~{} frames",
+			info.frame_count
+				.to_string()
+				.truecolor(CLR_VALUE.0, CLR_VALUE.1, CLR_VALUE.2)
+		),
+	);
+
+	// Spawn FFmpeg processes.
+	let (mut reader_child, reader_stdout) =
+		ffmpeg::spawn_reader(input).context("Failed to spawn FFmpeg reader")?;
+	let (mut writer_child, writer_stdin) =
+		ffmpeg::spawn_writer(&output_path, out_w, out_h, &info.fps_str, crf, container)
+			.context("Failed to spawn FFmpeg writer")?;
+
+	let start = Instant::now();
+
+	// Setup progress bars.
+	let multi = if show_progress {
+		Some(MultiProgress::new())
+	} else {
+		None
+	};
+
+	let tile_pb = multi.as_ref().map(|mp| {
+		let pb = mp.add(ProgressBar::new(0));
+		pb.set_style(tile_bar_style());
+		pb.enable_steady_tick(Duration::from_millis(SPINNER_TICK_MS));
+		pb
+	});
+
+	let frame_pb = multi.as_ref().map(|mp| {
+		let pb = mp.add(ProgressBar::new(info.frame_count as u64));
+		pb.set_style(batch_bar_style());
+		pb.enable_steady_tick(Duration::from_millis(SPINNER_TICK_MS));
+		pb
+	});
+
+	// Reader thread: reads raw RGB24 frames from FFmpeg stdout.
+	let frame_size = info.width * info.height * 3;
+	let (read_tx, read_rx) = bounded::<Vec<u8>>(2);
+	let reader_handle = thread::spawn(move || -> Result<()> {
+		let mut reader = BufReader::new(reader_stdout);
+		loop {
+			let mut frame = vec![0u8; frame_size];
+			match ffmpeg::read_frame(&mut reader, &mut frame) {
+				Ok(true) => {
+					if read_tx.send(frame).is_err() {
+						break;
+					}
+				}
+				Ok(false) => break,
+				Err(e) => return Err(e),
+			}
+		}
+		Ok(())
+	});
+
+	// Writer thread: writes upscaled RGB24 frames to FFmpeg stdin.
+	let (write_tx, write_rx) = bounded::<Vec<u8>>(2);
+	let writer_handle = thread::spawn(move || -> Result<()> {
+		let mut writer = std::io::BufWriter::new(writer_stdin);
+		for frame in write_rx {
+			writer
+				.write_all(&frame)
+				.map_err(|e| anyhow::anyhow!("Failed to write frame to FFmpeg: {e}"))?;
+		}
+		writer
+			.flush()
+			.map_err(|e| anyhow::anyhow!("Failed to flush FFmpeg writer: {e}"))
+	});
+
+	// Main inference loop: read frame → upscale → write.
+	let in_w = info.width as u32;
+	let in_h = info.height as u32;
+	let mut frames_written: usize = 0;
+	let mut inference_result: Result<()> = Ok(());
+
+	for raw_frame in &read_rx {
+		if cancel.is_cancelled() {
+			tracing::info!("Video upscale cancelled — finalising output");
+			break;
+		}
+
+		// Convert raw RGB24 bytes to DynamicImage.
+		let rgb_img = image::RgbImage::from_raw(in_w, in_h, raw_frame)
+			.ok_or_else(|| anyhow::anyhow!("Failed to create image from frame data"))?;
+		let img = DynamicImage::ImageRgb8(rgb_img);
+
+		// Reset tile bar for this frame.
+		if let Some(ref pb) = tile_pb {
+			pb.reset();
+			pb.set_length(0);
+			pb.set_message("".to_string());
+		}
+
+		let tile_pb_clone = tile_pb.clone();
+		let frame_start = Instant::now();
+		let options = UpscaleOptions {
+			tile_size,
+			tile_overlap,
+			blend: 0.0,
+			force_fp16: fp16,
+			cancel: cancel.clone(),
+			on_tile_done: Some(Box::new(move |done, total| {
+				if let Some(ref pb) = tile_pb_clone {
+					pb.set_length(total as u64);
+					pb.set_position(done as u64);
+					let elapsed = frame_start.elapsed();
+					let per_tile = if done > 0 {
+						elapsed / done as u32
+					} else {
+						Duration::ZERO
+					};
+					let remaining = total.saturating_sub(done);
+					let eta = if done > 0 && remaining > 0 {
+						format!("  ~{} left", format_duration(per_tile * remaining as u32))
+							.dimmed()
+							.to_string()
+					} else {
+						String::new()
+					};
+					pb.set_message(format!(
+						"{}/{} Upscaling…  {}  {}/tile{}",
+						done.to_string().bold().bright_white(),
+						total,
+						format_duration(elapsed).dimmed(),
+						format_duration(per_tile).dimmed(),
+						eta,
+					));
+				}
+			})),
+			on_blend_step: None,
+		};
+
+		let result = sqwale::pipeline::upscale_raw(&mut ctx, &img, &options);
+
+		// Clear tile bar after frame.
+		if let Some(ref pb) = tile_pb {
+			pb.set_position(pb.length().unwrap_or(0));
+			pb.set_message("".to_string());
+		}
+
+		let output_img = match result {
+			Ok(img) => img,
+			Err(e) => {
+				let msg = format!("{e:#}");
+				if msg == "Cancelled" {
+					break;
+				}
+				inference_result = Err(e);
+				break;
+			}
+		};
+
+		// Convert upscaled image to raw RGB24 bytes.
+		let output_rgb = output_img.into_rgb8();
+		let raw_output: Vec<u8> = output_rgb.into_raw();
+
+		if write_tx.send(raw_output).is_err() {
+			inference_result = Err(anyhow::anyhow!("Writer channel closed unexpectedly"));
+			break;
+		}
+
+		frames_written += 1;
+
+		// Update frame bar.
+		if let Some(ref pb) = frame_pb {
+			pb.set_position(frames_written as u64);
+			update_batch_message(pb, frames_written, info.frame_count, start);
+		}
+	}
+
+	// Drop channels to signal threads to finish.
+	drop(read_rx);
+	drop(write_tx);
+
+	// Wait for threads.
+	if let Err(e) = reader_handle.join().expect("reader thread panicked") {
+		if inference_result.is_ok() {
+			inference_result = Err(e.context("FFmpeg reader error"));
+		}
+	}
+	if let Err(e) = writer_handle.join().expect("writer thread panicked") {
+		if inference_result.is_ok() {
+			inference_result = Err(e.context("FFmpeg writer error"));
+		}
+	}
+
+	// Wait for FFmpeg processes.
+	let reader_status = reader_child
+		.wait()
+		.context("Failed to wait for FFmpeg reader")?;
+	if !reader_status.success() {
+		tracing::warn!("FFmpeg reader exited with status {}", reader_status);
+	}
+	let writer_status = writer_child
+		.wait()
+		.context("Failed to wait for FFmpeg writer")?;
+	if !writer_status.success() && inference_result.is_ok() {
+		inference_result = Err(anyhow::anyhow!(
+			"FFmpeg writer exited with status {}",
+			writer_status
+		));
+	}
+
+	// Clear progress bars.
+	if let Some(ref pb) = tile_pb {
+		pb.finish_and_clear();
+	}
+	if let Some(ref pb) = frame_pb {
+		pb.finish_and_clear();
+	}
+
+	// Free model memory before audio mux.
+	drop(ctx);
+
+	inference_result?;
+
+	// Audio mux.
+	if info.has_audio {
+		let mux_ext = format!("{}.audio", container.extension());
+		let muxed = output_path.with_extension(mux_ext);
+		ffmpeg::mux_audio_into(&output_path, input, &muxed, container)
+			.context("Failed to mux audio into output")?;
+		std::fs::rename(&muxed, &output_path)
+			.context("Failed to replace video-only output with muxed file")?;
+	}
+
+	let elapsed = start.elapsed();
+
+	// Output info line.
+	println!(
+		"{}  {} {}  {}  {}",
+		SYM_DOT.dimmed(),
+		"Output".dimmed(),
+		dims_str(out_w as u32, out_h as u32),
+		format_args!(
+			"{}{}",
+			format!("{:.2}", info.fps).truecolor(CLR_VALUE.0, CLR_VALUE.1, CLR_VALUE.2),
+			" fps".dimmed()
+		),
+		format_args!(
+			"{} frames",
+			frames_written
+				.to_string()
+				.truecolor(CLR_VALUE.0, CLR_VALUE.1, CLR_VALUE.2)
+		),
+	);
+
+	println!(
+		"{} {}  {}",
+		SYM_CHECK.green(),
+		path_str(&output_path.display().to_string()),
+		format_duration(elapsed).dimmed()
+	);
+
+	Ok(())
+}
+
 /// A prefetched image ready for GPU processing.
 struct PrefetchedImage {
 	/// Original index in the input list (0-based).
@@ -332,6 +690,7 @@ fn run_batch(
 	tile_overlap: u32,
 	blend: f32,
 	grain: u8,
+	fp16: bool,
 	show_progress: bool,
 	cancel: &CancelToken,
 ) -> Result<()> {
@@ -532,6 +891,7 @@ fn run_batch(
 			tile_overlap,
 			blend,
 			grain,
+			fp16,
 			cancel,
 			tile_pb.as_ref(),
 			&multi,
@@ -665,6 +1025,7 @@ fn process_single_image(
 	tile_overlap: u32,
 	blend: f32,
 	grain: u8,
+	fp16: bool,
 	cancel: &CancelToken,
 	tile_pb: Option<&ProgressBar>,
 	multi: &Option<MultiProgress>,
@@ -694,6 +1055,7 @@ fn process_single_image(
 		tile_size,
 		tile_overlap,
 		blend,
+		force_fp16: fp16,
 		cancel: cancel.clone(),
 		on_tile_done: Some(Box::new(move |done, total| {
 			if let Some(ref pb) = pb_clone {
@@ -840,6 +1202,42 @@ fn resolve_batch_output(input: &Path, output_dir: Option<&Path>, scale: u32) -> 
 			let name = filename.file_name().unwrap_or_default();
 			Ok(dir.join(name))
 		}
+	}
+}
+
+/// Resolve the output path and container format for video upscaling.
+///
+/// When `--output` is given, the container is inferred from its extension.
+/// When omitted, the output defaults to `{stem}_{scale}x.{input_ext_or_mkv}`.
+fn resolve_video_output(
+	input: &Path,
+	output_arg: Option<&str>,
+	scale: u32,
+) -> Result<(PathBuf, ContainerFormat)> {
+	if let Some(out) = output_arg {
+		let p = PathBuf::from(out);
+		let ext = p
+			.extension()
+			.unwrap_or_default()
+			.to_string_lossy()
+			.to_lowercase();
+		let container = ContainerFormat::from_extension(&ext);
+		let p = p.with_extension(container.extension());
+		Ok((p, container))
+	} else {
+		let stem = input
+			.file_stem()
+			.context("Input has no file stem")?
+			.to_string_lossy();
+		let in_ext = input
+			.extension()
+			.unwrap_or_default()
+			.to_string_lossy()
+			.to_lowercase();
+		let container = ContainerFormat::from_extension(&in_ext);
+		let parent = input.parent().unwrap_or(Path::new("."));
+		let path = parent.join(format!("{stem}_{scale}x.{}", container.extension()));
+		Ok((path, container))
 	}
 }
 

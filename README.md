@@ -13,7 +13,7 @@ Multiply your video's frame rate, upscale images with cutting-edge ONNX models, 
 - [Documentation](#documentation-)
 - [Usage](#usage)
   - [`interpolate` - Multiply Video Frame Rate](#interpolate---multiply-video-frame-rate)
-  - [`upscale` - Enhance Images](#upscale---enhance-images)
+  - [`upscale` - Enhance Images & Video](#upscale---enhance-images--video)
   - [`inspect` - Analyze Models](#inspect---analyze-models)
   - [Global Options](#global-options)
 - [Hardware Support](#hardware-support-)
@@ -42,7 +42,7 @@ So if you're the kind of person who has videos that need smoothing, images that 
 
 - **🎬 Frame interpolation** — Multiply video framerates (2×, 4×, 8×, …) using RIFE 4.25 with zero temporal artifacts
 - **🔍 Smart scene detection** — Detect hard cuts and avoid blurry ghosting across scene changes (keeps audio in sync)
-- **🖼️ Batch image upscaling** — Upscale photos and artwork with any ONNX super-resolution model
+- **🖼️ Image & video upscaling** — Upscale photos, artwork, and video with any ONNX super-resolution model
 - **🧩 Intelligent tiling** — Seamlessly handle images of any size with Hann-windowed blending (no visible seams)
 - **⚡ Multi-GPU support** — Auto-detects TensorRT, CUDA, DirectML, CoreML, XNNPACK; falls back to CPU
 - **🔀 Frequency blending** — Mix AI output with Lanczos upscaling via FFT Laplacian pyramid (best of both worlds)
@@ -85,11 +85,17 @@ sqwale interpolate myvideo.mp4 --scene-detect
 sqwale interpolate myvideo.mp4 -o output.mp4
 ```
 
-### 3. Upscale images
+### 3. Upscale images & video
 
 ```bash
 # Single image (uses bundled 4xLSDIRCompactv2 model)
 sqwale upscale photo.jpg
+
+# Video upscaling (auto-detected, same command)
+sqwale upscale myvideo.mp4
+
+# Video with custom quality and fp16 inference
+sqwale upscale myvideo.mp4 --crf 16 --fp16
 
 # Batch processing with custom model
 sqwale upscale "photos/*.jpg" -m mymodel.onnx -o upscaled/
@@ -170,15 +176,17 @@ When `--scene-detect` is enabled, consecutive frames are scored using mean absol
 
 ---
 
-### `upscale` - Enhance images
+### `upscale` - Enhance Images & Video
 
-Upscale images using ONNX super-resolution models. Handles any image size through intelligent tiling. Comes bundled with [4xLSDIRCompactv2](https://openmodeldb.info/models/4x-LSDIRCompact-v2); works with any compatible ONNX model.
+Upscale images and video using ONNX super-resolution models. Handles any image size through intelligent tiling. Comes bundled with [4xLSDIRCompactv2](https://openmodeldb.info/models/4x-LSDIRCompact-v2); works with any compatible ONNX model.
+
+Single files are automatically probed: video files are upscaled frame-by-frame through FFmpeg pipes, while images go through the standard tiling pipeline. Glob patterns and directories always process images only.
 
 ```bash
 sqwale upscale [OPTIONS] <INPUT>
 
 Arguments:
-  <INPUT>  Input image path or glob pattern
+  <INPUT>  Input image/video path or glob pattern
 
 Options:
   -m, --model <PATH>           ONNX model file                            [default: bundled]
@@ -187,9 +195,10 @@ Options:
   --tile-overlap <PX>          Overlap between tiles                      [default: 16]
   --blend <0.0–1.0>            Blend AI with Lanczos upscale via FFT      [default: 0.0]
   --grain <0–100>              Add monochrome luma noise post-upscale      [default: 0]
+  --crf <N>                    Video encoding quality (lower = better)    [default: 18]
 ```
 
-**Examples:**
+**Image examples:**
 
 ```bash
 # Single image with bundled model (output: input_4x.jpg)
@@ -211,12 +220,39 @@ sqwale upscale huge.jpg --tile-size 1024 --tile-overlap 64
 sqwale upscale small.jpg --tile-size 0
 ```
 
+**Video examples:**
+
+```bash
+# Upscale a video (auto-detected, output: input_4x.mkv)
+sqwale upscale video.mp4
+
+# Higher quality encoding
+sqwale upscale video.mp4 --crf 16
+
+# Explicit output format (mkv, mp4, or webm)
+sqwale upscale video.mp4 -o upscaled.mp4
+
+# With fp16 inference for lower VRAM usage
+sqwale upscale video.mp4 --fp16
+```
+
 **Batch mode dual progress:**
 ```
 ● [1/5] vacation/img1.jpg
   ·  Input  5776×3856
   ━━━━━━━━━━━━━━━━━━━━╌╌╌╌╌╌╌╌╌  12/24 tiles  1m 02s  3.9s/tile
   ━━━━━━━━╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌   1/5  images  1m 02s  ~4m 08s remaining
+```
+
+**Video upscale example output:**
+```
+● clip.mp4
+·  Model  4x  ·  RGB  ·  float32  ·  dynamic   embedded model via DirectML
+·  Input  1280×720  23.98 fps  ~1200 frames
+  ━━━━━━━━━━━━━━━━━━━━╌╌╌╌╌╌╌╌╌  6/12 tiles  2.1s/tile
+  ━━━━━━━━╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌   120/1200  frames  8m 20s  ~1h 10m remaining
+·  Output  5120×2880  23.98 fps  1200 frames
+✓ clip_4x.mkv  1h 18m 42s
 ```
 
 > [!TIP]
@@ -304,6 +340,7 @@ Options available for all commands:
 --tile-size <PX>       Tile size in pixels (0 = disable tiling)
 --tile-overlap <PX>    Overlap between tiles
 --blend <0.0–1.0>      Blend AI with Lanczos upscale via FFT [default: 0.0]
+--fp16                 Force half-precision (fp16) inference for lower VRAM usage
 ```
 
 **Examples:**
@@ -314,6 +351,10 @@ sqwale interpolate video.mp4 --provider cpu
 
 # Use specific GPU provider
 sqwale upscale photo.jpg --provider tensorrt
+
+# Half-precision inference (lower VRAM, faster on some GPUs)
+sqwale upscale video.mp4 --fp16
+sqwale interpolate video.mp4 --fp16
 ```
 
 ---

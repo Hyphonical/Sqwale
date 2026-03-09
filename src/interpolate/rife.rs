@@ -16,8 +16,11 @@ use crate::pipeline::tensor::{crop_tensor, pad_tensor_mirror};
 use crate::pipeline::tiling::Padding;
 use crate::session::{ProviderSelection, SessionConfig, create_session};
 
-/// RIFE 4.25 embedded model bytes.
-const RIFE_MODEL_BYTES: &[u8] = include_bytes!("../../models/rife425_fp32_op21_slim.onnx");
+/// RIFE 4.25 embedded model bytes (fp32).
+const RIFE_FP32_MODEL_BYTES: &[u8] = include_bytes!("../../models/rife425_fp32_op21_slim.onnx");
+
+/// RIFE 4.25 embedded model bytes (fp16).
+const RIFE_FP16_MODEL_BYTES: &[u8] = include_bytes!("../../models/rife425_fp16_op21_slim.onnx");
 
 /// Alignment requirement for RIFE spatial dimensions.
 const RIFE_ALIGNMENT: usize = 32;
@@ -25,16 +28,22 @@ const RIFE_ALIGNMENT: usize = 32;
 /// An ORT session loaded with the embedded RIFE 4.25 model.
 pub struct RifeSession {
 	session: Session,
+	/// Whether this session uses the fp16 model variant.
+	fp16: bool,
 }
 
 impl RifeSession {
 	/// Create a new RIFE session using the given execution provider.
 	///
+	/// When `fp16` is true, the fp16 model variant is loaded for reduced
+	/// VRAM usage and faster GPU inference.
+	///
 	/// Reuses the same provider-fallback logic as the upscale pipeline.
-	pub fn new(provider: ProviderSelection) -> Result<Self> {
-		let session = create_rife_session(provider)?;
-		info!("RIFE 4.25 model loaded and optimized");
-		Ok(Self { session })
+	pub fn new(provider: ProviderSelection, fp16: bool) -> Result<Self> {
+		let session = create_rife_session(provider, fp16)?;
+		let variant = if fp16 { "fp16" } else { "fp32" };
+		info!("RIFE 4.25 ({variant}) model loaded and optimized");
+		Ok(Self { session, fp16 })
 	}
 
 	/// Run a single interpolation between two frames at the given timestep.
@@ -93,15 +102,21 @@ impl RifeSession {
 		let combined = Array4::from_shape_vec((1, 7, padded_h, padded_w), combined_data)
 			.map_err(|e| anyhow::anyhow!("Failed to build combined tensor: {e}"))?;
 
-		// Create ORT input value.
-		let input_value = ort::value::Value::from_array(combined)
-			.map_err(|e| anyhow::anyhow!("Failed to create ORT value: {e}"))?;
-
-		// Run inference.
-		let outputs = self
-			.session
-			.run(ort::inputs![input_value])
-			.map_err(|e| anyhow::anyhow!("RIFE inference failed: {e}"))?;
+		// Run inference — fp16 or fp32 depending on model variant.
+		let outputs = if self.fp16 {
+			let f16_combined = combined.mapv(half::f16::from_f32);
+			let input_value = ort::value::Value::from_array(f16_combined)
+				.map_err(|e| anyhow::anyhow!("Failed to create ORT fp16 value: {e}"))?;
+			self.session
+				.run(ort::inputs![input_value])
+				.map_err(|e| anyhow::anyhow!("RIFE fp16 inference failed: {e}"))?
+		} else {
+			let input_value = ort::value::Value::from_array(combined)
+				.map_err(|e| anyhow::anyhow!("Failed to create ORT value: {e}"))?;
+			self.session
+				.run(ort::inputs![input_value])
+				.map_err(|e| anyhow::anyhow!("RIFE inference failed: {e}"))?
+		};
 
 		// Extract output tensor.
 		let (_, output) = outputs
@@ -204,12 +219,19 @@ fn flip_horizontal(tensor: &Array4<f32>) -> Array4<f32> {
 }
 
 /// Extract the first output as an f32 `Array4` with shape `(1, C, H, W)`.
+///
+/// Handles both f32 and f16 output tensors.
 fn extract_output_f32(output: &ort::value::ValueRef<'_>) -> Result<Array4<f32>> {
 	if let Ok((shape, data)) = output.try_extract_tensor::<f32>() {
 		let dims: Vec<usize> = (**shape).iter().map(|&d| d as usize).collect();
 		return reshape_to_nchw(data.to_vec(), &dims);
 	}
-	bail!("RIFE output is not float32")
+	if let Ok((shape, data)) = output.try_extract_tensor::<half::f16>() {
+		let dims: Vec<usize> = (**shape).iter().map(|&d| d as usize).collect();
+		let f32_data: Vec<f32> = data.iter().map(|v| v.to_f32()).collect();
+		return reshape_to_nchw(f32_data, &dims);
+	}
+	bail!("RIFE output is not float32 or float16")
 }
 
 /// Reshape a flat `f32` buffer into an NCHW `Array4`, accepting 3-D or 4-D shapes.
@@ -228,7 +250,13 @@ fn reshape_to_nchw(data: Vec<f32>, dims: &[usize]) -> Result<Array4<f32>> {
 /// CPU sessions get multi-threaded intra-op parallelism and Level3 optimization.
 /// GPU sessions get Level3 optimization but default (single) intra-op threads
 /// to avoid competing with Rayon on the CPU side.
-fn create_rife_session(provider: ProviderSelection) -> Result<Session> {
+fn create_rife_session(provider: ProviderSelection, fp16: bool) -> Result<Session> {
+	let model_bytes = if fp16 {
+		RIFE_FP16_MODEL_BYTES
+	} else {
+		RIFE_FP32_MODEL_BYTES
+	};
+
 	let config = SessionConfig {
 		configure_cpu: Some(Box::new(|b| {
 			b.with_optimization_level(GraphOptimizationLevel::Level3)
@@ -242,9 +270,8 @@ fn create_rife_session(provider: ProviderSelection) -> Result<Session> {
 		})),
 	};
 
-	let (session, _provider_used) = create_session(provider, &config, |b| {
-		b.commit_from_memory(RIFE_MODEL_BYTES)
-	})?;
+	let (session, _provider_used) =
+		create_session(provider, &config, |b| b.commit_from_memory(model_bytes))?;
 
 	Ok(session)
 }

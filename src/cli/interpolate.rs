@@ -137,7 +137,8 @@ pub fn run(input: &str, output_arg: Option<&str>, ia: InterpolateArgs, args: &Cl
 	);
 
 	// Load RIFE model with spinner.
-	let mut rife = with_spinner("Loading RIFE model…", || RifeSession::new(provider))
+	let fp16 = args.fp16;
+	let mut rife = with_spinner("Loading RIFE model…", || RifeSession::new(provider, fp16))
 		.context("Failed to load RIFE model")?;
 
 	let start = Instant::now();

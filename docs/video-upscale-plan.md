@@ -1,5 +1,8 @@
 # Video Upscaling Feature — Planning Questions
 
+> **Status: Implemented.** Video upscaling is now available in the `upscale` command.
+> Single video files are auto-detected via ffprobe. Output supports MKV, MP4, and WebM containers.
+
 Answer these questions so a detailed implementation plan can be written.
 
 ---
@@ -165,7 +168,7 @@ The existing pipe/channel sizing should be sufficient for managing memory pressu
 | **Progress display** | Two-level: outer frame bar + inner tile bar |
 | **Blend / Grain** | Disabled for video upscaling |
 | **Audio** | Copy losslessly via `mux_audio_into`; skip silently if absent |
-| **Output naming** | `{stem}_{scale}x.mkv`; enforce `.mkv` when `--output` given |
+| **Output naming** | `{stem}_{scale}x.{ext}`; infers container from `--output` extension (mkv/mp4/webm) |
 | **Batch video** | Not supported — error out on glob with video files |
 | **Tiling** | Reuse global `--tile-size` / `--tile-overlap` flags |
 | **Model** | Same as images — bundled 4xLSDIRCompactv2, auto-detect scale |
