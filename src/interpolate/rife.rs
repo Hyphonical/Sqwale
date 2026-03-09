@@ -8,11 +8,13 @@
 use anyhow::{Result, bail};
 use ndarray::{Array4, Axis, concatenate, s};
 use ort::session::Session;
+use ort::session::builder::GraphOptimizationLevel;
 use rayon::prelude::*;
+use tracing::info;
 
 use crate::pipeline::tensor::{crop_tensor, pad_tensor_mirror};
 use crate::pipeline::tiling::Padding;
-use crate::session::{ProviderSelection, make_ep};
+use crate::session::{ProviderSelection, SessionConfig, create_session};
 
 /// RIFE 4.25 embedded model bytes.
 const RIFE_MODEL_BYTES: &[u8] = include_bytes!("../../models/rife425_fp32_op21_slim.onnx");
@@ -31,6 +33,7 @@ impl RifeSession {
 	/// Reuses the same provider-fallback logic as the upscale pipeline.
 	pub fn new(provider: ProviderSelection) -> Result<Self> {
 		let session = create_rife_session(provider)?;
+		info!("RIFE 4.25 model loaded and optimized");
 		Ok(Self { session })
 	}
 
@@ -220,88 +223,30 @@ fn reshape_to_nchw(data: Vec<f32>, dims: &[usize]) -> Result<Array4<f32>> {
 	}
 }
 
-/// Create an ORT session for the embedded RIFE model with provider fallback.
+/// Create an ORT session for the embedded RIFE model using shared session logic.
+///
+/// CPU sessions get multi-threaded intra-op parallelism and Level3 optimization.
+/// GPU sessions get Level3 optimization but default (single) intra-op threads
+/// to avoid competing with Rayon on the CPU side.
 fn create_rife_session(provider: ProviderSelection) -> Result<Session> {
-	use ort::session::builder::AutoDevicePolicy;
-	use tracing::warn;
-
-	let commit =
-		|b: &mut ort::session::builder::SessionBuilder| b.commit_from_memory(RIFE_MODEL_BYTES);
-
-	// CPU inference: use all available cores for intra-op parallelism.
-	let configure_cpu =
-		|b: ort::session::builder::SessionBuilder| -> Result<ort::session::builder::SessionBuilder> {
-			b.with_optimization_level(ort::session::builder::GraphOptimizationLevel::Level3)
+	let config = SessionConfig {
+		configure_cpu: Some(Box::new(|b| {
+			b.with_optimization_level(GraphOptimizationLevel::Level3)
 				.map_err(|e| anyhow::anyhow!("Failed to set optimization level: {e}"))?
-				.with_intra_threads(
-					std::thread::available_parallelism().map_or(4, |n| n.get()),
-				)
+				.with_intra_threads(std::thread::available_parallelism().map_or(4, |n| n.get()))
 				.map_err(|e| anyhow::anyhow!("Failed to set thread count: {e}"))
-		};
-
-	// GPU inference: do not override ORT's default CPU thread count (1).
-	// Forcing many intra-op threads on a GPU session competes with Rayon's
-	// pool on the CPU side without benefiting GPU throughput.
-	let configure_gpu =
-		|b: ort::session::builder::SessionBuilder| -> Result<ort::session::builder::SessionBuilder> {
-			b.with_optimization_level(ort::session::builder::GraphOptimizationLevel::Level3)
+		})),
+		configure_gpu: Some(Box::new(|b| {
+			b.with_optimization_level(GraphOptimizationLevel::Level3)
 				.map_err(|e| anyhow::anyhow!("Failed to set optimization level: {e}"))
-		};
+		})),
+	};
 
-	match provider {
-		ProviderSelection::Auto => {
-			let mut builder = configure_gpu(
-				Session::builder()
-					.map_err(|e| anyhow::anyhow!("Failed to create session builder: {e}"))?
-					.with_auto_device(AutoDevicePolicy::MaxPerformance)
-					.map_err(|e| anyhow::anyhow!("Failed to configure auto device: {e}"))?,
-			)?;
-			Ok(commit(&mut builder)
-				.map_err(|e| anyhow::anyhow!("Failed to load RIFE model: {e}"))?)
-		}
-		ProviderSelection::Cpu => {
-			let ep = make_ep(ProviderSelection::Cpu)?;
-			let mut builder = configure_cpu(
-				Session::builder()
-					.map_err(|e| anyhow::anyhow!("Failed to create session builder: {e}"))?
-					.with_execution_providers([ep])
-					.map_err(|e| anyhow::anyhow!("Failed to configure CPU provider: {e}"))?,
-			)?;
-			Ok(commit(&mut builder)
-				.map_err(|e| anyhow::anyhow!("Failed to load RIFE model: {e}"))?)
-		}
-		requested => {
-			let ep = make_ep(requested)?;
-			let try_result = Session::builder()
-				.map_err(|e| e.to_string())
-				.and_then(|b| b.with_execution_providers([ep]).map_err(|e| e.to_string()))
-				.and_then(|b| configure_gpu(b).map_err(|e| e.to_string()))
-				.and_then(|mut b| commit(&mut b).map_err(|e| e.to_string()));
+	let (session, _provider_used) = create_session(provider, &config, |b| {
+		b.commit_from_memory(RIFE_MODEL_BYTES)
+	})?;
 
-			match try_result {
-				Ok(session) => Ok(session),
-				Err(e) => {
-					warn!(
-						"{} provider failed ({}), falling back to CPU",
-						requested.name(),
-						e
-					);
-					let ep = make_ep(ProviderSelection::Cpu)?;
-					let mut builder = configure_cpu(
-						Session::builder()
-							.map_err(|e| anyhow::anyhow!("Failed to create session builder: {e}"))?
-							.with_execution_providers([ep])
-							.map_err(|e| {
-								anyhow::anyhow!("Failed to configure CPU fallback: {e}")
-							})?,
-					)?;
-					Ok(commit(&mut builder).map_err(|e| {
-						anyhow::anyhow!("Failed to load RIFE model with CPU fallback: {e}")
-					})?)
-				}
-			}
-		}
-	}
+	Ok(session)
 }
 
 // ── Tests ──────────────────────────────────────────────────────────────────

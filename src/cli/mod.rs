@@ -103,8 +103,8 @@ pub enum Commands {
 		/// Input video file path.
 		input: String,
 
-		/// Output video file path (always .mkv).
-		/// Omit to write next to the input as `{stem}_{multiplier}x.mkv`.
+		/// Output video file path (mkv, mp4, or webm).
+		/// Omit to write next to the input with the same container format.
 		#[arg(short, long)]
 		output: Option<String>,
 

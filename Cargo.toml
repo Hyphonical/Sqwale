@@ -24,7 +24,7 @@ half    = "2"
 
 # ── Image Processing ──────────────────────────────────────────────────────
 image = { version = "0.25", default-features = false, features = [
-    "png", "jpeg", "webp"
+    "png", "jpeg", "webp", "tiff", "bmp", "gif"
 ] }
 
 # ── CLI & Output ──────────────────────────────────────────────────────────

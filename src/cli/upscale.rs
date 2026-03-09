@@ -220,12 +220,21 @@ fn run_single(
 				} else {
 					Duration::ZERO
 				};
+				let remaining = total.saturating_sub(done);
+				let eta = if done > 0 && remaining > 0 {
+					format!("  ~{} left", format_duration(per_tile * remaining as u32))
+						.dimmed()
+						.to_string()
+				} else {
+					String::new()
+				};
 				pb.set_message(format!(
-					"{}/{} Upscaling…  {}  {}/tile",
+					"{}/{} Upscaling…  {}  {}/tile{}",
 					done.to_string().bold().bright_white(),
 					total,
 					format_duration(elapsed).dimmed(),
 					format_duration(per_tile).dimmed(),
+					eta,
 				));
 			}
 		})),
@@ -696,12 +705,21 @@ fn process_single_image(
 				} else {
 					Duration::ZERO
 				};
+				let remaining = total.saturating_sub(done);
+				let eta = if done > 0 && remaining > 0 {
+					format!("  ~{} left", format_duration(per_tile * remaining as u32))
+						.dimmed()
+						.to_string()
+				} else {
+					String::new()
+				};
 				pb.set_message(format!(
-					"{}/{} Upscaling…  {}  {}/tile",
+					"{}/{} Upscaling…  {}  {}/tile{}",
 					done.to_string().bold().bright_white(),
 					total,
 					format_duration(elapsed).dimmed(),
 					format_duration(per_tile).dimmed(),
+					eta,
 				));
 			}
 		})),
@@ -807,7 +825,6 @@ fn resolve_output_path(input: &Path, output_arg: Option<&str>, scale: u32) -> Re
 				let name = filename.file_name().unwrap_or_default();
 				Ok(out_path.join(name))
 			} else {
-				imageio::check_extension_match(input, out_path)?;
 				Ok(out_path.to_path_buf())
 			}
 		}

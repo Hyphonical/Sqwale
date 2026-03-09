@@ -1,28 +1,65 @@
-# 🐋 Sqwale
+# Sqwale 🐋
 
-A fast, cross-platform CLI for AI-powered video and image enhancement. Frame interpolation with RIFE, image upscaling with ONNX super-resolution models, GPU acceleration, and zero-disk pipeline architecture.
+**AI-powered video and image enhancement. Blazingly fast.**
 
----
+Multiply your video's frame rate, upscale images with cutting-edge ONNX models, inspect model metadata, and do it all on your GPU. No cloud. No APIs. No waiting around. Just you, your media, and some seriously clever neural networks running locally on your machine.
 
-## ✨ Features
+## Table of Contents
 
-- 🎞️ **Frame interpolation** — multiply video frame rates using RIFE 4.25 (2×, 4×, 8×, …)
-- 🔍 **Scene detection** — skip RIFE inference across hard cuts, duplicate the pre-cut frame to keep audio sync
-- 🖼️ **Image upscaling** — batch upscale with any ONNX super-resolution model (4xLSDIRCompactv2 bundled)
-- 🧩 **Tiling** — seamlessly process images of any size with Hann-windowed tile blending
-- ⚡ **GPU acceleration** — TensorRT, CUDA, DirectML, CoreML, XNNPACK, with automatic CPU fallback
-- 🔀 **Frequency blending** — mix AI output with Lanczos upscale via an FFT Laplacian pyramid
-- 🎛️ **Ensemble mode** — horizontal-flip averaging for higher fidelity RIFE output
-- 📦 **Zero-disk video pipeline** — all frame data flows through OS pipes; no temp files written
-- 🚀 **Prefetch pipeline** — batch upscaling loads the next image from disk while the GPU is busy
-- 🎨 **Clean terminal output** — progress bars, per-tile timing, coloured status lines
-- 🛑 **Graceful cancellation** — Ctrl+C finishes the current item; second press exits immediately
+- [What's This About?](#whats-this-about)
+- [Why?](#why)
+- [Features](#features-)
+- [Quick Start](#quick-start-)
+- [Documentation](#documentation-)
+- [Usage](#usage)
+  - [`interpolate` - Multiply Video Frame Rate](#interpolate---multiply-video-frame-rate)
+  - [`upscale` - Enhance Images](#upscale---enhance-images)
+  - [`inspect` - Analyze Models](#inspect---analyze-models)
+  - [Global Options](#global-options)
+- [Hardware Support](#hardware-support-)
+- [Contributing](#contributing)
+- [License](#license)
 
----
+## What's This About?
 
-## 📦 Installation
+You know that feeling when you have a video shot at 24fps and it feels choppy when you play it back at 60fps? Or when you've got a beautiful photo but it's not quite sharp enough? Or when you find a cool ONNX model online and want to know exactly what it does before using it?
 
-Requires Rust **1.85** or later. For `interpolate`, [FFmpeg](https://ffmpeg.org/download.html) **≥ 5.1** must be on your `PATH` (the `-vf colorspace` filter used for raw-frame decoding was introduced in 5.1).
+Sqwale fixes that.
+
+Type `sqwale interpolate myvideo.mp4` and boom—it's now twice as smooth with perfectly blended frames. Pipe in `sqwale upscale photo.jpg` and get a beautifully upscaled version, automatically handling any image size with intelligent tiling. Run `sqwale inspect model.onnx` and get a human-readable breakdown of what's inside that black box.
+
+Sqwale uses [RIFE 4.25](https://github.com/megvii-research/RIFE) for frame interpolation (the same tech that Netflix uses to smooth slow-motion content) and supports any ONNX super-resolution model you throw at it. It comes bundled with [4xLSDIRCompactv2](https://openmodeldb.info/models/4x-LSDIRCompact-v2) for upscaling. It automatically detects your GPU and does all the heavy lifting with zero-disk streaming pipelines—everything flows through OS pipes, nothing hits the disk.
+
+## Why?
+
+Look, I could wax poetic about how "video enhancement is underutilized in local workflows" or something. But honestly? It's because I wanted a tool that was **fast**, **local**, and **didn't require reading 10 blog posts to set up**. Something I could just `cargo build --release` and start using immediately.
+
+Also, RIFE is sick. FFmpeg pipes are neat. Rust is cool.
+
+So if you're the kind of person who has videos that need smoothing, images that need sharpening, or you're just curious about what's inside an ONNX model, maybe Sqwale is for you too. ✨
+
+## Features 🎯
+
+- **🎬 Frame interpolation** — Multiply video framerates (2×, 4×, 8×, …) using RIFE 4.25 with zero temporal artifacts
+- **🔍 Smart scene detection** — Detect hard cuts and avoid blurry ghosting across scene changes (keeps audio in sync)
+- **🖼️ Batch image upscaling** — Upscale photos and artwork with any ONNX super-resolution model
+- **🧩 Intelligent tiling** — Seamlessly handle images of any size with Hann-windowed blending (no visible seams)
+- **⚡ Multi-GPU support** — Auto-detects TensorRT, CUDA, DirectML, CoreML, XNNPACK; falls back to CPU
+- **🔀 Frequency blending** — Mix AI output with Lanczos upscaling via FFT Laplacian pyramid (best of both worlds)
+- **🎛️ Ensemble mode** — Horizontal-flip averaging for even higher fidelity RIFE output
+- **📦 Streaming pipelines** — Video data flows through OS pipes; zero temporary files written to disk
+- **🚀 Prefetch threading** — Next image loads from disk while GPU processes the current one (no GPU idle time)
+- **🎨 Beautiful output** — Per-tile timing, progress bars, colored status—actually enjoyable to watch
+- **🛑 Graceful shutdown** — Ctrl+C finishes current item; second press exits immediately
+- **🔬 Model inspection** — Analyze ONNX model metadata: scale factor, channel layout, precision, compatible tiling
+- **🌍 Cross-platform** — Works on Windows, Linux, macOS
+- **📚 Library support** — Use Sqwale as a Rust crate for integration into other projects
+
+## Quick Start 🚀
+
+### 1. Install
+
+Requires Rust **1.85** or later. For video interpolation, requires [FFmpeg](https://ffmpeg.org/download.html) **≥ 5.1** on your `PATH`.
 
 ```bash
 git clone https://github.com/Hyphonical/Sqwale.git
@@ -30,227 +67,351 @@ cd Sqwale
 cargo build --release
 ```
 
-The binary lands at `target/release/sqwale` (or `sqwale.exe` on Windows).
+Binary at `target/release/sqwale` (or `sqwale.exe` on Windows).
 
----
-
-## 🎞️ Interpolate
-
-Multiply a video's frame rate using RIFE 4.25. All processing is done in-memory through piped FFmpeg processes — nothing is written to disk between frames.
+### 2. Multiply video framerate
 
 ```bash
 # 2× frame rate (default)
-sqwale interpolate input.mp4
+sqwale interpolate myvideo.mp4
 
-# 4× with lower CRF for better quality output
-sqwale interpolate input.mp4 -x 4 --crf 16
+# 4× with high quality
+sqwale interpolate myvideo.mp4 -x 4 --crf 16
 
-# Enable scene-aware detection so cuts don't get blended
-sqwale interpolate input.mp4 --scene-detect
+# With smart scene detection (avoids blurry cuts)
+sqwale interpolate myvideo.mp4 --scene-detect
 
-# Tune the cut sensitivity (default 0.4; lower = more sensitive)
-sqwale interpolate input.mp4 --scene-detect --scene-threshold 0.3
-
-# Ensemble mode for higher quality (slower)
-sqwale interpolate input.mp4 --ensemble
-
-# Explicit output path
-sqwale interpolate input.mp4 -o output.mkv
+# Explicit output path (mkv, mp4, or webm)
+sqwale interpolate myvideo.mp4 -o output.mp4
 ```
 
-```
-● input.mp4
-·  Config  2×  ·  CRF 18  ·  Standard  ·  Scene 0.40   RIFE 4.25 via auto
-·  Input  1920×1080  24.00 fps  ~2400 frames
-  ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━  4799/4799 Interpolating…
-·  Output  1920×1080  48.00 fps  4799 frames
-✓ input_2x.mkv  38s
-```
-
-### How scene detection works
-
-When `--scene-detect` is enabled, each pair of consecutive frames is scored using mean absolute difference (the same algorithm as FFmpeg's `scdet` filter). If the score exceeds the threshold, the last pre-cut frame is duplicated `(multiplier − 1)` times instead of running RIFE inference. This keeps the output frame count correct for audio sync while avoiding the blurry ghosting that RIFE produces across hard cuts.
-
-> **See also:** [docs/architecture.md](docs/architecture.md) for a detailed explanation of the three-stage interpolation pipeline.
-
-### Interpolate options
-
-| Option | Description | Default |
-|---|---|---|
-| `-x`, `--multiplier <N>` | Frame rate multiplier (power of two: 2, 4, 8, …) | `2` |
-| `--crf <N>` | x264/NVENC quality (lower = better quality, larger file) | `18` |
-| `--ensemble` | Horizontal-flip averaging for higher fidelity | off |
-| `--scene-detect` | Detect cuts and duplicate instead of interpolating | off |
-| `--scene-threshold <0–1>` | Cut sensitivity; lower = more sensitive | `0.4` |
-| `-o`, `--output <path>` | Output path (always `.mkv`) | next to input |
-
----
-
-## 🖼️ Upscale
-
-Upscale images using any ONNX super-resolution model. The bundled default is [4xLSDIRCompactv2](https://openmodeldb.info/models/4x-LSDIRCompact-v2).
+### 3. Upscale images
 
 ```bash
-# Single image (output: input_4x.png)
-sqwale upscale input.png -m model.onnx
+# Single image (uses bundled 4xLSDIRCompactv2 model)
+sqwale upscale photo.jpg
 
-# Explicit output path
-sqwale upscale input.png -m model.onnx -o output.png
+# Batch processing with custom model
+sqwale upscale "photos/*.jpg" -m mymodel.onnx -o upscaled/
 
-# Batch processing into a folder
-sqwale upscale "photos/*.jpg" -m model.onnx -o upscaled/
-
-# Custom tiling
-sqwale upscale input.png -m model.onnx --tile-size 768 --tile-overlap 32
-
-# Frequency-domain blending with Lanczos
-sqwale upscale input.png -m model.onnx --blend 0.5
+# With frequency blending (smoother, less "plasticky")
+sqwale upscale photo.jpg --blend 0.3
 ```
 
-```
-● input.jpg
-·  Model  4x · RGB · float32 · dynamic  model.onnx via auto
-·  Input  4000×6000
-  ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━  117/117 Upscaling…  27s  0.2s/tile
-·  Output  16000×24000
-✓ input_4x.jpg  27s
-```
-
-Batch mode shows dual progress bars — per-image tile progress on top, overall batch progress with ETA below. A background prefetch thread keeps up to 2 images loaded from disk while the GPU is processing the current one:
-
-```
-● [1/5] photos/img1.jpg
-  ·  Input  5776×3856
-  ━━━━━━━━━━━━━━━━━━━━╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌  12/24 tiles  1m 02s  3.9s/tile
-  ━━━━━━━━╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌   1/5  images  1m 02s  ~4m 08s remaining
-```
-
-> **See also:** [docs/architecture.md](docs/architecture.md) for a detailed explanation of the batch prefetch pipeline.
-
-### Upscale options
-
-| Option | Description | Default |
-|---|---|---|
-| `-m`, `--model <path>` | ONNX model file (bundled 4xLSDIRCompactv2 if omitted) | bundled |
-| `-o`, `--output <path>` | Output path or directory | next to input |
-| `--tile-size <px>` | Tile size in pixels (`0` = no tiling) | `512` |
-| `--tile-overlap <px>` | Overlap between adjacent tiles | `16` |
-| `--blend <0.0–1.0>` | Blend AI output with Lanczos upscale via FFT Laplacian pyramid | `0.0` |
-
----
-
-## 🔬 Inspect
-
-Analyse ONNX model metadata without running inference:
+### 4. Inspect models
 
 ```bash
+# See what's inside an ONNX model
 sqwale inspect model.onnx
 sqwale inspect "models/*.onnx"
 sqwale inspect models/
 ```
 
-```
-● 2x-AnimeSharpV2_MoSR_Sharp_fp16.onnx
- ├─ Scale      2x  via DepthToSpace (PixelShuffle)
- ├─ Color      RGB  in:3 → out:3
- ├─ Precision  float16 → float16
- ├─ Opset      17
- ├─ Tiling     supported  dynamic spatial dims
- │   └─ Alignment  divisible by 16
- ╰─ Ops        866  total nodes
-      ├─ 180  Constant
-      ├─ 101  Unsqueeze
-      ├─ 100  Mul
-      ├─  80  Conv
-      ├─  74  Add
-      ╰─       … more op types
-```
+## Usage
 
----
+### `interpolate` - Multiply video frame rate
 
-## ⚡ Provider selection
-
-Sqwale picks the best available provider automatically:
-
-| Platform | Priority |
-|---|---|
-| Windows | TensorRT → CUDA → DirectML → CPU |
-| Linux | TensorRT → CUDA → XNNPACK → CPU |
-| macOS | CoreML → CPU |
-
-Override with `--provider cuda`. Falls back to CPU on failure.
+Make your video smoother by generating intermediate frames using RIFE 4.25. All processing happens in-memory through piped FFmpeg processes—nothing is written to disk between frames.
 
 ```bash
-sqwale interpolate input.mp4 --provider cuda
-sqwale upscale input.png -m model.onnx --provider cpu
+sqwale interpolate [OPTIONS] <INPUT>
+
+Arguments:
+  <INPUT>  Input video file path
+
+Options:
+  -x, --multiplier <N>         Frame rate multiplier (2, 4, 8, …)        [default: 2]
+  -o, --output <PATH>          Output file path (mkv, mp4, or webm)        [default: auto]
+  --crf <N>                    x264/NVENC quality (lower = better)        [default: 18]
+  --ensemble                   Horizontal-flip averaging for higher quality
+  --scene-detect               Detect hard cuts and duplicate instead of interpolating
+  --scene-threshold <0.0–1.0>  Scene detection sensitivity               [default: 0.1]
 ```
 
-> **See also:** [docs/providers.md](docs/providers.md) for per-provider install requirements.
+**Examples:**
+
+```bash
+# Quick smooth—2× framerate, reasonable quality
+sqwale interpolate movie.mp4
+
+# Better quality output (slower, larger file)
+sqwale interpolate movie.mp4 -x 4 --crf 16 --ensemble
+
+# With scene detection (prevents ghosting across cuts)
+sqwale interpolate action.mp4 --scene-detect --scene-threshold 0.15
+
+# Ultra smooth (may look unnatural in some scenes)
+sqwale interpolate footage.mp4 -x 8
+
+# Increase scene detection sensitivity (lower = more sensitive to cuts)
+sqwale interpolate interview.mp4 --scene-detect --scene-threshold 0.05
+```
+
+**How scene detection works:**
+When `--scene-detect` is enabled, consecutive frames are scored using mean absolute difference (same algorithm as FFmpeg's `scdet`). If the score exceeds the threshold, the last pre-cut frame is duplicated instead of running RIFE inference. This keeps frame count correct for audio sync while avoiding blurry ghosting across cuts.
+
+> [!TIP]
+> **Start with default settings** — use `--scene-detect --scene-threshold 0.1` if your video has hard cuts (interviews, action scenes, screen recordings).
+
+> [!TIP]
+> **Ensemble mode is slower but smoother** — Use `--ensemble` when you have time and want maximum quality. It runs RIFE with horizontal flips and averages the results for less flickering.
+
+**Example output:**
+```
+● interview.mp4
+·  Config  2×  ·  CRF 18  ·  Standard  ·  Scene 0.10   RIFE 4.25 via CUDA
+·  Input  1920×1080  24.00 fps  ~2400 frames
+  ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━  4799/4799 Interpolating…
+·  Output  1920×1080  48.00 fps  4799 frames
+✓ interview_2x.mkv  38s
+```
+
+> **See also:** [docs/architecture.md](docs/architecture.md) for pipeline internals and threading details.
 
 ---
 
-## 🧩 Tiling
+### `upscale` - Enhance images
 
-Large images are split into overlapping tiles, each processed independently, then blended with cosine-weighted (Hann) windows for seamless output.
+Upscale images using ONNX super-resolution models. Handles any image size through intelligent tiling. Comes bundled with [4xLSDIRCompactv2](https://openmodeldb.info/models/4x-LSDIRCompact-v2); works with any compatible ONNX model.
 
-- **Dynamic models** use `--tile-size` (default 512 px), respecting model-alignment requirements.
-- **Fixed-size models** automatically use the model's required tile dimensions.
-- **Disable tiling** with `--tile-size 0` to process the full image at once.
+```bash
+sqwale upscale [OPTIONS] <INPUT>
 
-> **See also:** [docs/tiling.md](docs/tiling.md) for a detailed guide including VRAM budgeting.
+Arguments:
+  <INPUT>  Input image path or glob pattern
+
+Options:
+  -m, --model <PATH>           ONNX model file                            [default: bundled]
+  -o, --output <PATH>          Output path or directory                    [default: auto]
+  --tile-size <PX>             Tile size in pixels (0 = disable)          [default: 512]
+  --tile-overlap <PX>          Overlap between tiles                      [default: 16]
+  --blend <0.0–1.0>            Blend AI with Lanczos upscale via FFT      [default: 0.0]
+  --grain <0–100>              Add monochrome luma noise post-upscale      [default: 0]
+```
+
+**Examples:**
+
+```bash
+# Single image with bundled model (output: input_4x.jpg)
+sqwale upscale photo.jpg
+
+# Explicit model and output
+sqwale upscale photo.jpg -m animesharp.onnx -o upscaled.jpg
+
+# Batch processing into a folder
+sqwale upscale "vacation/*.jpg" -m model.onnx -o vacation_upscaled/
+
+# Frequency blending for smoother results (less "plasticky" AI look)
+sqwale upscale photo.jpg --blend 0.5
+
+# Custom tiling for high VRAM systems (faster, needs more memory)
+sqwale upscale huge.jpg --tile-size 1024 --tile-overlap 64
+
+# Disable tiling (loads full image into VRAM—use for small images or big GPUs)
+sqwale upscale small.jpg --tile-size 0
+```
+
+**Batch mode dual progress:**
+```
+● [1/5] vacation/img1.jpg
+  ·  Input  5776×3856
+  ━━━━━━━━━━━━━━━━━━━━╌╌╌╌╌╌╌╌╌  12/24 tiles  1m 02s  3.9s/tile
+  ━━━━━━━━╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌   1/5  images  1m 02s  ~4m 08s remaining
+```
+
+> [!TIP]
+> **Frequency blending (`--blend`) tips:**
+> - `0.0` (default): Pure AI output—sharpest but can look artificial
+> - `0.3–0.5`: Sweet spot for photos—AI detail + natural look
+> - `0.7–1.0`: AI provides fine detail only; Lanczos handles structure and color
+
+> [!TIP]
+> **Tile size tuning:** Larger tiles are faster but use more VRAM. Use `--tile-size 0` if your image fits in your GPU's memory; otherwise tune to your GPU.
+
+> **See also:** [docs/tiling.md](docs/tiling.md) for VRAM budgeting and alignment requirements.
+
+> **See also:** [docs/architecture.md](docs/architecture.md) for prefetch pipeline details.
 
 ---
 
-## 🖼️ Supported image formats
+### `inspect` - Analyze models
 
-PNG, JPEG, WebP, GIF, TIFF, BMP, ICO, PNM, QOI, HDR — via the [image](https://github.com/image-rs/image) crate. Output format always matches input.
+Examine ONNX model metadata without running inference. Perfect for understanding what a model does before committing to it.
+
+```bash
+sqwale inspect [OPTIONS] <PATTERN>
+
+Arguments:
+  <PATTERN>  File path, glob pattern, or directory containing .onnx files
+```
+
+**Examples:**
+
+```bash
+# Single model
+sqwale inspect model.onnx
+
+# All models in a directory
+sqwale inspect models/
+
+# Glob pattern
+sqwale inspect "models/*.onnx"
+```
+
+**Example output:**
+```
+● 4x-LSDIRCompactv2.onnx
+ ├─ Scale      4x  via DepthToSpace (PixelShuffle)
+ ├─ Color      RGB  in:3 → out:3
+ ├─ Precision  float32 → float32
+ ├─ Opset      17
+ ├─ Tiling     supported  dynamic spatial dims
+ │   └─ Alignment  divisible by 8
+ ╰─ Ops        566  total nodes
+      ├─ 142  Constant
+      ├─  89  Conv
+      ├─  76  Add
+      ├─  64  Unsqueeze
+      ╰─       … more op types
+
+● 2x-AnimeSharpV2.onnx
+ ├─ Scale      2x  via ConvTranspose
+ ├─ Color      RGB  in:3 → out:3
+ ├─ Precision  float16 → float16
+ ├─ Opset      14
+ ├─ Tiling     not supported  fixed spatial dims
+ ├─ Alignment  (N/A)
+ ╰─ Ops        234  total nodes
+      └─ …
+```
+
+**What you're looking at:**
+- **Scale** — How much bigger the output is (2×, 4×, etc.) and how it's achieved
+- **Color** — Color space and channel count (RGB or other)
+- **Precision** — Input/output data types (float32, float16, etc.)
+- **Opset** — ONNX operator set version
+- **Tiling** — Whether the model supports tiling (for huge images)
+- **Ops** — Breakdown of neural network layers
 
 ---
 
-## 🤖 Model compatibility
+### Global Options
 
-Works with ONNX super-resolution models that use:
+Options available for all commands:
 
-- NCHW layout, RGB (3-channel) input/output
-- float32 or float16 precision
-- `[0, 1]` normalisation range
-- Scale detection via DepthToSpace, ConvTranspose, Resize, metadata, or static shape ratio
+```bash
+--provider <TYPE>      Execution provider: auto, cpu, cuda, tensorrt, directml, coreml, xnnpack
+--tile-size <PX>       Tile size in pixels (0 = disable tiling)
+--tile-overlap <PX>    Overlap between tiles
+--blend <0.0–1.0>      Blend AI with Lanczos upscale via FFT [default: 0.0]
+```
 
-**Where to find models:** [OpenModelDB](https://openmodeldb.info) · [upscale.wiki](https://upscale.wiki)
+**Examples:**
 
-The bundled default is [4xLSDIRCompactv2](https://openmodeldb.info/models/4x-LSDIRCompact-v2) by Phhofm, licensed under [CC BY 4.0](https://creativecommons.org/licenses/by/4.0/).
+```bash
+# Force CPU mode
+sqwale interpolate video.mp4 --provider cpu
 
-> **See also:** [docs/models.md](docs/models.md) for model selection advice and compatibility notes.
+# Use specific GPU provider
+sqwale upscale photo.jpg --provider tensorrt
+```
 
 ---
 
-## 🌍 Environment variables
+## Hardware Support ⚡
+
+Sqwale auto-detects your best available platform:
+
+| Platform | Provider Priority | Performance |
+|----------|------------------|-------------|
+| **Windows** | TensorRT → CUDA → DirectML → CPU | Fastest with RTX GPUs |
+| **Linux** | TensorRT → CUDA → XNNPACK → CPU | Fastest with any NVIDIA GPU |
+| **macOS** | CoreML → CPU | Very fast on Apple Silicon (M1/M2/M3) |
+
+> [!TIP]
+> Override auto-detection with `--provider cuda` or `--provider cpu`. When a provider fails, Sqwale falls back automatically (with a warning).
+
+| Provider | What You Need | Speed |
+|----------|---------------|-------|
+| **TensorRT** | NVIDIA GPU + CUDA Toolkit + TensorRT | Ultra-fast (50–100ms/image) |
+| **CUDA** | NVIDIA GPU + CUDA Toolkit | Very fast (80–150ms/image) |
+| **CoreML** | Apple Silicon (M1/M2/M3) | Very fast (80–150ms/image) |
+| **DirectML** | Windows 10+ with GPU | Fast (150–300ms/image) |
+| **XNNPACK** | ARM or x64 CPU | Moderate (200–400ms/image) |
+| **CPU** | Any CPU | Slow (500–2000ms/image) |
+
+> **See also:** [docs/providers.md](docs/providers.md) for detailed setup instructions per provider.
+
+---
+
+## Supported Media
+
+| Format | Images | Video |
+|--------|--------|-------|
+| **Formats** | PNG, JPEG, WebP, GIF, TIFF, BMP, ICO, PNM, QOI, HDR | MP4, MKV, WebM, AVI, MOV (via FFmpeg) |
+| **Output** | Any supported format | MKV, MP4, or WebM (defaults to input container) |
+
+---
+
+## Model Compatibility
+
+Sqwale works with ONNX super-resolution models that follow these requirements:
+
+- **Layout:** NCHW (batch, channels, height, width)
+- **Color space:** RGB (3-channel input/output)
+- **Precision:** float32 or float16
+- **Normalization:** `[0, 1]` range
+- **Scale detection:** Via DepthToSpace, ConvTranspose, Resize, or metadata
+
+**Where to find models:**
+- [OpenModelDB](https://openmodeldb.info) — Curated ONNX model repository
+- [upscale.wiki](https://upscale.wiki) — Community upscaler database
+- [Real-ESRGAN](https://github.com/xinntao/Real-ESRGAN) — State-of-the-art upscalers
+
+**Default bundled model:**
+[4xLSDIRCompactv2](https://openmodeldb.info/models/4x-LSDIRCompact-v2) by Phhofm
+- **Scale:** 4×
+- **License:** [CC BY 4.0](https://creativecommons.org/licenses/by/4.0/)
+- **Performance:** Great quality/speed tradeoff, ~100ms on CUDA, works on CPU
+
+> **See also:** [docs/models.md](docs/models.md) for model recommendations and compatibility troubleshooting.
+
+---
+
+## Environment Variables
 
 | Variable | Effect |
-|---|---|
-| `NO_COLOR` | Disable coloured output |
-| `CI` | Disable colours and progress bars |
-| `RUST_LOG` | Log verbosity (e.g. `sqwale=debug`) |
+|----------|-----------|
+| `NO_COLOR` | Disable colored output |
+| `CI` | Disable colors and progress bars (auto-detected) |
+| `RUST_LOG` | Log verbosity; e.g., `sqwale=debug` for detailed logs |
+| `ORT_LOG_SEVERITY_LEVEL` | Control ONNX Runtime diagnostics (Sqwale suppresses by default) |
 
 ---
 
-## 📚 Documentation
+## Documentation 📚
 
-| Doc | Contents |
-|---|---|
-| [docs/architecture.md](docs/architecture.md) | Pipeline internals: channel layout, thread roles, frame flow |
-| [docs/tiling.md](docs/tiling.md) | Tile sizing, overlap, Hann blending, VRAM budgeting |
-| [docs/providers.md](docs/providers.md) | GPU provider setup, platform matrix, fallback behaviour |
-| [docs/models.md](docs/models.md) | Model compatibility, scale detection, format requirements |
+| Doc | Purpose |
+|-----|---------|
+| [docs/architecture.md](docs/architecture.md) | Internals: threading, channel design, streaming pipelines |
+| [docs/providers.md](docs/providers.md) | GPU provider setup, platform matrix, compatibility |
+| [docs/tiling.md](docs/tiling.md) | Image tiling, VRAM budgeting, Hann blending math |
+| [docs/models.md](docs/models.md) | Model selection, compatibility, troubleshooting |
 
 ---
 
-## 📄 License
+## Contributing
+
+PRs welcome! Please run `cargo fmt` and `cargo clippy` before submitting. Follow Rust idioms and the existing code style. Add tests for new behavior.
+
+See [docs/architecture.md](docs/architecture.md) for codebase overview.
+
+---
+
+## License
 
 MIT — see [LICENSE](LICENSE) for details.
 
 ---
 
-## 🤝 Contributing
-
-Contributions welcome! Please run `cargo fmt` and `cargo clippy` before submitting, follow Rust idioms and the existing code style, and add tests for new behaviour.
+Made with ☕, neural networks, and Rust. If you've got videos that need smoothing or images that need sharpening, Sqwale's got you.

@@ -1,129 +1,238 @@
-# Model Compatibility
+# Model Compatibility 🤖
 
-This document describes the ONNX model requirements for use with Sqwale, how scale factors and other properties are detected, and where to find compatible models.
+**What makes a model work with Sqwale?**
 
----
-
-## Requirements
-
-A compatible super-resolution model must satisfy:
-
-| Property | Requirement |
-|---|---|
-| Format | ONNX (`.onnx`) |
-| Layout | NCHW (`[batch, channels, height, width]`) |
-| Channels | 1 (grayscale), 3 (RGB), or 4 (RGBA) |
-| Precision | float32 or float16 |
-| Value range | `[0.0, 1.0]` normalised |
-| Batch size | 1 (static or dynamic) |
-
-NHWC layouts (last-channel convention) are detected automatically from the output shape heuristic and transposed to NCHW before further processing.
+This document explains the ONNX requirements, how Sqwale detects model properties, where to find compatible models, and what to do when things don't work.
 
 ---
 
-## Scale detection
+## What Sqwale Needs
 
-Sqwale infers the upscale factor by inspecting the model graph. It tries the following detection strategies in priority order:
+A compatible super-resolution model must satisfy these requirements:
 
-| Strategy | How it works |
-|---|---|
-| `metadata_props` | Reads the `scale` field from ONNX model metadata if present |
-| `DepthToSpace (PixelShuffle)` | Detects a `DepthToSpace` node and reads its `blocksize` attribute |
-| `ConvTranspose stride` | Detects transposed convolutions and reads stride values |
-| `Resize scales initializer` | Inspects the scales tensor of a `Resize` node |
-| `static shape ratio` | Computes `output_height / input_height` from static shapes |
-| `assumed` | Falls back to scale = 4 when no other evidence is found |
+| Property | Requirement | Why? |
+|---|---|---|
+| **Format** | ONNX (`.onnx` file) | ONNX Runtime standard |
+| **Layout** | NCHW (`[batch, channels, height, width]`) | GPU-optimized memory layout |
+| **Channels** | 1 (grayscale), 3 (RGB), or 4 (RGBA) | Standard image channel counts |
+| **Precision** | float32 or float16 | Both supported natively |
+| **Value range** | `[0.0, 1.0]` normalized | Sqwale's input standard |
+| **Batch size** | 1 (static or dynamic) | Single-image processing |
 
-The detected scale and its source are shown by `sqwale inspect`:
+> [!TIP]
+> NHWC layouts (last-channel convention) are detected automatically and transposed to NCHW. So if your model uses NHWC, Sqwale will figure it out.
+
+---
+
+## Scale Detection 🔍
+
+Sqwale doesn't require you to manually specify the upscale factor. It inspects the model graph and tries to figure it out automatically:
+
+| Strategy | How it works | Priority |
+|---|---|---|
+| `metadata_props` | Reads the `scale` field from ONNX metadata | 1st (most reliable) |
+| `DepthToSpace` | Detects PixelShuffle and reads `blocksize` | 2nd |
+| `ConvTranspose` | Reads stride values | 3rd |
+| `Resize` | Inspects the scales tensor | 4th |
+| `static shape ratio` | Computes `output_height / input_height` | 5th |
+| `assumed` | Falls back to scale = 4 | Last resort |
+
+When you run `sqwale inspect model.onnx`, it shows which strategy worked:
 
 ```
 ├─ Scale  4x  via DepthToSpace (PixelShuffle)
 ```
 
+or
+
+```
+├─ Scale  2x  via ConvTranspose stride=2
+```
+
+Usually Sqwale gets it right on the first or second strategy. If it guesses wrong, you can override it by adding a `scale` field to the model's ONNX metadata.
+
 ---
 
-## Tiling compatibility
+## Tiling Support 🧩
 
 Whether a model can be tiled depends on its spatial dimension constraints:
 
-- **Dynamic spatial dims** — `height` and `width` input dimensions are symbolic (e.g. `?` or named). These models can be tiled freely, subject to alignment.
-- **Fixed spatial dims** — input dimensions are hardcoded integers. Sqwale uses those exact dimensions as the tile size regardless of `--tile-size`.
-- **Alignment requirement** — transformer-based models with window-partition patterns require input dimensions to be divisible by a specific value (typically 8, 16, or 32). Sqwale auto-detects this and rounds up the tile size accordingly.
+| What | Tiling | Example |
+|---|---|---|
+| **Dynamic spatial dims** | ✓ Freely tileable | Dims are `?` or named like `img_h` |
+| **Fixed spatial dims** | ✗ Not tileable | Input is hardcoded as `64×64` |
+| **Alignment requirement** | ✓ Works with alignment | Transformer; requires divisibility by 16 |
 
-Run `sqwale inspect` to see what a model reports:
+Sqwale auto-detects these at inspection time:
 
+```bash
+sqwale inspect model.onnx
+```
+
+**Output for a tiling-compatible model:**
 ```
 ├─ Tiling  supported  dynamic spatial dims
 │   └─ Alignment  divisible by 16
 ```
 
-or
-
+**Output for a fixed-size model:**
 ```
 ├─ Tiling  not supported  fixed 64×64 input
 ```
 
+If a model is fixed-size, Sqwale will always use that size for tiles, regardless of `--tile-size`.
+
 ---
 
-## Precision
+## Precision Handling
 
-Both float32 and float16 models are supported. For float16 models, input tensors are automatically cast to `f16` before inference and outputs are cast back to `f32` for blending and saving. No manual configuration is required.
+Both float32 and float16 models are fully supported:
 
-The precision reported by `sqwale inspect` reflects the model's declared input and output element types:
+- **float32:** Standard precision; lossless  
+- **float16:** Half precision; uses less VRAM, slightly faster, minor precision loss
+
+Sqwale automatically converts to the model's expected precision before inference and converts back to float32 for blending and saving. No manual configuration needed.
+
+The `sqwale inspect` output shows the declared types:
 
 ```
 ├─ Precision  float16 → float16
 ```
 
+or
+
+```
+├─ Precision  float32 → float32
+```
+
 ---
 
-## Color space
+## Color Space Detection
 
-Sqwale infers the color space from the number of input channels:
+Sqwale infers the color space from input channel count:
 
-| Channels | Color space |
+| Channels | Color space | Behavior |
+|---|---|---|
+| **1** | Grayscale | Upscales grayscale; saves as grayscale |
+| **3** | RGB | Standard RGB upscaling |
+| **4** | RGBA | Upscales including alpha channel |
+| **Other** | Unknown | Error; open an issue |
+
+The model **must** match your image channel count. You can't upscale RGB images with a grayscale model.
+
+---
+
+## The Bundled Default: 4xLSDIRCompactv2
+
+Sqwale comes with a solid general-purpose model packed inside the binary:
+
+- **Author:** [Phhofm](https://github.com/Phhofm)
+- **Scale:** 4× (outputs 4× the resolution)
+- **Channels:** 3 (RGB)
+- **Precision:** float32
+- **Training:** LSDIR dataset
+- **License:** [CC BY 4.0](https://creativecommons.org/licenses/by/4.0/)
+- **Tiling:** Fully supported; dynamic spatial dims
+- **Alignment:** None (no restrictions)
+- **Performance:** ~100ms per 512px tile on CUDA
+
+It's modern, fast, and produces good results on photographs and artwork. Fair warning: it's a model trained on diverse content, so don't expect perfection on specialized domains (anime, extreme close-ups, etc.).
+
+---
+
+## Finding Better Models
+
+**[OpenModelDB](https://openmodeldb.info)** — The gold standard. Curated database with hundreds of super-resolution and other image models. Filterable by:
+- Scale factor (2×, 4×, etc.)
+- Target domain (photography, anime, art, etc.)
+- Architecture (Real-ESRGAN, SRVGGv2, etc.)
+- License
+
+**[upscale.wiki](https://upscale.wiki)** — Community wiki with:
+- Detailed model comparisons and benchmarks
+- Use-case guides ("best for anime," "best for photos," etc.)
+- Links to model repositories
+- User reviews
+
+**Downloading tips:**
+1. Look for `.onnx` files (not `.pth`, `.safetensors`, `.pt`, etc.)
+2. Check the license matches your use case
+3. Verify the stated scale factor matches your need
+4. Test on a small image first before batch processing
+
+---
+
+## Color Space Basics
+
+If your model expects a different color space, you have options:
+
+| Scenario | Solution |
 |---|---|
-| 1 | Grayscale |
-| 3 | RGB |
-| 4 | RGBA |
-| other | Unknown (N channels) |
+| Model expects `[0, 255]` range but Sqwale sends `[0, 1]` | Re-export the ONNX with corrected normalization (advanced) |
+| Model expects BGR but you have RGB | Use ffmpeg to convert: `ffmpeg -i input.jpg -vf "format=bgr24" output.jpg` then upscale |
+| Model has wrong channel count | Downscale to grayscale or convert color space upstream |
 
-Images are loaded and saved in the same format as the input file. No color space conversion is performed.
-
----
-
-## The bundled model
-
-The bundled default is **4xLSDIRCompactv2** by [Phhofm](https://github.com/Phhofm), a compact 4× RGB super-resolution model trained on the LSDIR dataset.
-
-- License: [CC BY 4.0](https://creativecommons.org/licenses/by/4.0/)
-- Scale: 4×
-- Precision: float32
-- Tiling: supported, dynamic spatial dims
-- Alignment: 1 (no restriction)
-- Source: [OpenModelDB](https://openmodeldb.info/models/4x-LSDIRCompact-v2)
-
----
-
-## Finding models
-
-**[OpenModelDB](https://openmodeldb.info)** — the largest curated database of super-resolution models. Filterable by scale, architecture, license, and training dataset.
-
-**[upscale.wiki](https://upscale.wiki)** — community wiki with model comparisons, use-case guides, and links to model repositories.
-
-When downloading models, check that:
-- The file extension is `.onnx` (not `.pth`, `.safetensors`, etc.).
-- The listed scale matches your intended use.
-- The license permits your use case.
+Most modern models expect `[0, 1]` range and RGB order, so these issues are rare.
 
 ---
 
 ## Troubleshooting
 
-**"No tiles were processed"** — the model produced no output. This usually means the model's input dtype is not float32 or float16, or the value range is not `[0, 1]`.
+### "Inference produced zero output"
 
-**"Unsupported output tensor rank N"** — the model outputs a tensor with an unexpected shape. Open an issue with the output of `sqwale inspect model.onnx`.
+**Symptoms:** Output image is black or transparent.
 
-**"Inference failed: …"** — an ORT runtime error. Common causes: the model requires an opset version not supported by the installed ORT version, or the model uses a custom operator not included in the standard ORT build.
+**Likely cause:** Model input dtype or value range mismatch.
 
-**Black or washed-out output** — the model likely expects input in the `[0, 255]` range rather than `[0, 1]`. Sqwale normalises to `[0, 1]`. If you have a model like this, it cannot be used with Sqwale without reexporting the ONNX graph with corrected normalisation.
+**Fix:** 
+- Verify the model was trained on `[0, 1]` inputs, not `[0, 255]`
+- Check channel count (1, 3, or 4)
+- Re-export the model if needed
+
+### "Unsupported output tensor rank N"
+
+**Symptoms:** Error message referencing an unexpected tensor shape.
+
+**Likely cause:** Model outputs an unusual tensor layout.
+
+**Fix:** Open an issue with the output of `sqwale inspect model.onnx` and we can debug it.
+
+### "Inference failed: <error from ONNX Runtime>"
+
+**Symptoms:** Runtime error during processing.
+
+**Common causes:**
+- Opset version mismatch (model is too new or too old for installed ONNX Runtime)
+- Model uses custom operators not in standard ONNX Runtime
+- Unsupported layer (e.g., some GPU-specific extensions)
+
+**Fix:**
+- Try `--provider cpu` to see if it's provider-specific
+- Check model opset version: `sqwale inspect model.onnx | grep Opset`
+- Report the full error with model details
+
+### "Output is washed out or inverted"
+
+**Symptoms:** Image colors look completely wrong.
+
+**Likely cause:** The model expects `[0, 1]` but your images are in a different range, or vice versa.
+
+**Fix:**
+- Double-check the model's training documentation
+- Try a different model to isolate the issue
+- Use `ffmpeg` to normalize images before upscaling
+
+---
+
+## Advanced: Custom Model Inference
+
+You can use Sqwale as a Rust library for custom inference workflows:
+
+```rust
+use sqwale::session::Session;
+
+let session = Session::new("my_model.onnx", "auto")?;
+let // ... load image, run inference
+```
+
+See the [architecture documentation](architecture.md) for pipeline details.

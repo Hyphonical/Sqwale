@@ -1,12 +1,14 @@
-# Pipeline Architecture
+# Pipeline Architecture 🏗️
 
-This document describes the internal thread and channel layout for both video interpolation and batch image upscaling.
+**How Sqwale actually works under the hood.**
+
+This document describes the thread and channel layout for both video interpolation and batch image upscaling. If you're curious about how Sqwale keeps the GPU busy while files load, or why scene detection doesn't make clips smooth out, you've come to the right place.
 
 ---
 
-## Interpolation pipeline (`sqwale interpolate`)
+## Interpolation Pipeline (`sqwale interpolate`)
 
-Interpolation is a five-actor system. Each actor runs on its own OS thread and communicates exclusively via bounded `crossbeam` channels, so no actor can stall another beyond its buffer capacity.
+Video interpolation is a five-actor system. Each actor runs on its own OS thread and communicates exclusively via bounded `crossbeam` channels. No actor can stall another beyond its buffer capacity—this is deliberate, allowing us to hide latency and keep the GPU working while frames load.
 
 ```
 FFmpeg reader process
@@ -31,81 +33,117 @@ FFmpeg reader process
                                               stdin (raw RGB24 bytes)
 ```
 
-### Channel sizing rationale
+### Why Split It Up?
 
-| Channel | Capacity | Reason |
+FFmpeg I/O, CPU normalization, and GPU inference all have different speeds and bottleneck points. By splitting them into separate threads with bounded channels, each stage can proceed at its own pace:
+
+- **Reader** can fill its buffer without waiting for the GPU
+- **Prep** converts bytes to tensors while the GPU is busy with previous frames  
+- **GPU** does the actual RIFE inference (the expensive part)
+- **Writer** encodes and writes while the GPU is already working on the next frame
+
+This `3+4+16` channel capacity arrangement (9 frames of potential buffering) means the GPU is almost never idle, and your video encodes in minimal wall-clock time.
+
+### Channel Sizing Explained
+
+| Channel | Capacity | Why? |
 |---|---|---|
-| `read_rx` | 8 | FFmpeg is fast; a larger buffer prevents it from stalling when the prep thread is busy |
-| `prep_rx` | 4 | Each entry holds a full decoded frame tensor (~25 MB for 1080p); keeping it small bounds peak RAM |
-| `write_rx` | 16 | Output frames arrive in short bursts from recursive mid-frame generation; headroom avoids GPU idle |
+| `read_rx` | 8 | FFmpeg is fast; larger buffer prevents stalling when Prep is busy |
+| `prep_rx` | 4 | Each tensor is ~25 MB for 1080p; small buffer keeps peak RAM bounded |
+| `write_rx` | 16 | Output frames arrive in short bursts during recursive generation; headroom avoids GPU idle |
 
-### Thread roles
+### What Each Thread Does
 
-**Reader thread** — wraps FFmpeg's stdout in a `BufReader` and reads exactly `width × height × 3` bytes per frame. On EOF it exits cleanly, closing `read_tx` which signals the prep thread.
+**Reader thread** — Wraps FFmpeg's stdout in a `BufReader` and reads exactly `width × height × 3` bytes per frame. Runs continuously until EOF, then closes `read_tx` to signal the prep thread it's done.
 
-**Prep thread** — calls `bytes_to_tensor` to convert raw `u8` RGB24 into a normalised `[0, 1]` f32 NCHW `Array4`. This is pure CPU work; overlapping it with GPU inference is the main purpose of the three-stage split.
+**Prep thread** — Calls `bytes_to_tensor` to convert raw `u8` RGB24 into normalized `[0, 1]` f32 NCHW tensors. Pure CPU work, overlapped with GPU inference—that's the whole point of this split.
 
-**Main thread (GPU)** — runs RIFE inference. Receives `(raw_bytes, tensor_a)` pairs from the prep channel, calls `generate_midframes`, and sends the results to the write channel. Owns frame ordering and scene-cut logic.
+**Main thread (GPU)** — Runs RIFE inference. Receives `(raw_bytes, tensor_a)` pairs from prep, calls `generate_midframes`, sends results to write. Owns frame ordering and scene-cut logic. This is where RIFE does its magic.
 
-**Writer thread** — receives `WriteTask` variants:
-- `Raw(Vec<u8>)` — written directly to FFmpeg stdin (passthrough for the first frame and scene-cut duplicates).
-- `Tensor(Array4<f32>)` — converted to `u8` RGB24 via `tensor_to_bytes` before writing. This conversion runs here so it overlaps with the next GPU inference call.
+**Writer thread** — Receives two types of tasks:
+- `Raw(Vec<u8>)` — written directly to FFmpeg stdin (used for the very first frame and scene-cut duplicates).  
+- `Tensor(Array4<f32>)` — converted to `u8` RGB24 via `tensor_to_bytes` before writing. This conversion runs async, overlapping with the next GPU inference call.
 
-### Recursive mid-frame generation
+---
 
-For a multiplier of `N`, `generate_midframes` produces `N − 1` evenly-spaced intermediate frames using recursive binary subdivision:
+### Recursive Mid-frame Generation
 
-- `2×` → t = 0.5 (one RIFE call)
-- `4×` → t = 0.25, 0.5, 0.75 (three calls: first compute t = 0.5, then recurse each half)
-- `8×` → seven calls using the same subdivision
+When you ask for `N×` frame multiplication, RIFE generates `N − 1` intermediate frames using recursive binary subdivision. This is key to temporal consistency:
 
-This preserves temporal consistency because each pair of bounding frames is always used directly, rather than blending across larger time gaps at higher multipliers.
+- **2×** → `t = 0.5` (one RIFE call)
+- **4×** → `t = 0.25, 0.5, 0.75` (three calls: first compute `t = 0.5`, then recurse each half)  
+- **8×** → seven calls, same principle
 
-### Scene detection
+Why recursive? Because each pair of bounding frames stays "anchored" directly by RIFE, rather than blending across larger time gaps. This prevents temporal smearing at higher multipliers and keeps motion coherent throughout the framerate multiplication.
 
-When `--scene-detect` is active, consecutive raw frame buffers are scored with a mean absolute difference formula identical to FFmpeg's `scdet` filter:
+---
+
+### Scene Detection 🎬
+
+When `--scene-detect` is active, consecutive raw frame buffers are scored with a mean absolute difference formula identical to FFmpeg's `scdet`:
 
 ```
 score = sum(|a[i] - b[i]|) / (N × 255)
 ```
 
-Scores above the threshold indicate a cut. Instead of running RIFE, the last pre-cut frame is duplicated `(multiplier − 1)` times, keeping total output frame count and audio sync intact.
+Scores above the threshold indicate a hard cut. Instead of running RIFE (which would produce ghosting), the last pre-cut frame is duplicated `(multiplier − 1)` times. Output frame count stays the same, audio sync is preserved, and no blur across the cut.
 
-Scene scoring uses Rayon parallel iterators, splitting the ~6 MB 1080p buffer across all CPU cores to avoid a single-threaded bottleneck on the main inference thread.
+Frame scoring uses Rayon parallel iterators to split the ~6 MB 1080p buffer across all CPU cores. This keeps the main GPU thread unblocked while scoring happens.
+
+> [!TIP]
+> Scene detection is disabled by default because it adds per-frame overhead. Enable it only if your video has hard cuts (interviews, sports, screen recordings).
 
 ---
 
-## Batch upscale pipeline (`sqwale upscale` — batch mode)
+## Batch Upscale Pipeline (`sqwale upscale` — batch mode)
 
-Single-file upscale is fully synchronous. Batch mode introduces a two-actor split:
+Single-image upscaling is synchronous and simple. But batch mode is where things get fun—we use two actors to hide disk I/O latency:
 
 ```
   Prefetch thread  ──[prefetch_tx/prefetch_rx  cap 2]──►  GPU loop (main thread)
   (disk I/O)                                               (inference + save)
 ```
 
-### Prefetch thread
+### Prefetch Thread (Disk Loading)
 
-Iterates the resolved input list in order. For each file:
-1. Calls `resolve_batch_output` to build the output path.
-2. Calls `imageio::load_image` to decode the image into a `DynamicImage`.
-3. Sends a `PrefetchedImage { index, input, output, result }` down the channel.
+Runs ahead of the GPU. For each image in the batch:
 
-Load and path-resolution errors are wrapped in `result: Err(…)` rather than aborting the thread — the GPU loop handles them as per-image failures and continues. The thread exits cleanly when the channel receiver is dropped (cancellation) or when the input list is exhausted.
+1. Resolves the output path
+2. Calls `imageio::load_image` to decode the image into memory (this is slow—JPEG decompression, etc.)  
+3. Sends `PrefetchedImage { index, input, output, result }` down the channel
 
-Channel capacity of 2 means at most two full decoded images live in RAM ahead of the GPU. For large images this is intentionally conservative — a 24 MP JPEG decoded to RGB24 is ~72 MB uncompressed.
+If a load fails, the error is wrapped in `result: Err(…)` instead of crashing the thread. The GPU loop handles per-image failures and continues.
 
-### GPU loop (main thread)
+Channel capacity is intentionally small (2). For a 24 MP JPEG decoded to RGB24, that's ~72 MB uncompressed. Two images in the buffer is conservative but safe—no runaway memory usage even with huge images.
 
-Drains the prefetch channel via `for item in &prefetch_rx`. For each item:
-1. Checks the cancellation token and breaks if set, dropping the receiver to unblock the prefetch thread.
-2. Prints the per-image header at this point (not in the prefetch thread), so terminal output reflects when the GPU actually starts on each image.
-3. Handles load errors by recording them in the `failed` list and continuing.
-4. Calls `process_single_image` with the already-decoded `DynamicImage`.
-5. Updates progress bars.
+> [!TIP]
+> The prefetch thread exits cleanly when you press Ctrl+C (the channel receiver is dropped), unblocking it to terminate gracefully.
 
-After the loop, joins the prefetch thread and reports the batch summary.
+### GPU Loop (Main Thread)
 
-### Error collection
+Drains the prefetch channel continuously. For each image:
 
-Both load errors (from the prefetch thread) and inference/save errors (from `process_single_image`) are appended to the same `failed: Vec<(PathBuf, String)>` list. The summary at the end of the batch reports all failures together, consistent with the pre-existing single-threaded behaviour.
+1. Checks the cancellation token; breaks if Ctrl+C was pressed
+2. Prints the per-image header now (not in the prefetch thread), so terminal output reflects *when the GPU actually starts*, not when it finished loading
+3. Handles load errors by appending to the `failed` list and continuing  
+4. Calls `process_single_image` with the already-decoded image
+5. Updates progress bars
+
+After the channel empties, joins the prefetch thread and prints the summary (files processed, failed, etc.).
+
+### Error Handling
+
+Both load errors (prefetch thread) and inference/save errors (GPU loop) go into the same `failed: Vec<(PathBuf, String)>` list. At the end, the batch summary reports all failures together, consistent with single-file mode behavior.
+
+---
+
+## Why This Matters
+
+These thread designs exist to solve real bottlenecks:
+
+- **Video interpolation:** Unbundled reader/prep/GPU/writer keeps every component fed, minimizing wall-clock time.
+- **Batch upscaling:** Prefetch loading hides disk latency, so while image `N` loads from disk, image `N-1` is already done and saved.
+
+Both allow you to feed Sqwale work faster than it can consume it, which is the sign of good pipelining.
+
+For more details on tiling and blending, see [docs/tiling.md](tiling.md).

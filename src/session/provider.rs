@@ -22,7 +22,7 @@ impl ProviderSelection {
 	/// Human-readable name for display.
 	pub fn name(self) -> &'static str {
 		match self {
-			Self::Auto => "auto",
+			Self::Auto => "Auto",
 			Self::Cpu => "CPU",
 			Self::Cuda => "CUDA",
 			Self::TensorRT => "TensorRT",
@@ -167,6 +167,6 @@ mod tests {
 	#[test]
 	fn name_round_trip() {
 		assert_eq!(ProviderSelection::Cpu.name(), "CPU");
-		assert_eq!(ProviderSelection::Auto.name(), "auto");
+		assert_eq!(ProviderSelection::Auto.name(), "Auto");
 	}
 }

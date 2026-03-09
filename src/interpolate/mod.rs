@@ -16,6 +16,7 @@ use std::time::Instant;
 use tracing::{debug, info, trace};
 
 use crate::ffmpeg;
+use crate::ffmpeg::ContainerFormat;
 use crate::pipeline::CancelToken;
 
 pub use rife::RifeSession;
@@ -41,6 +42,9 @@ pub struct InterpolateOptions {
 
 	/// x264 CRF value for the output encoder.
 	pub crf: u32,
+
+	/// Output container format.
+	pub container: ContainerFormat,
 
 	/// When `Some(threshold)`, frames whose pixel difference exceeds the
 	/// threshold are treated as scene cuts: the last pre-cut frame is
@@ -100,8 +104,14 @@ pub fn run(
 
 	// Spawn FFmpeg processes.
 	let (mut reader_child, reader_stdout) = ffmpeg::spawn_reader(input)?;
-	let (mut writer_child, writer_stdin) =
-		ffmpeg::spawn_writer(output, info.width, info.height, &out_fps_str, options.crf)?;
+	let (mut writer_child, writer_stdin) = ffmpeg::spawn_writer(
+		output,
+		info.width,
+		info.height,
+		&out_fps_str,
+		options.crf,
+		options.container,
+	)?;
 
 	// Three-stage pipeline decouples I/O, CPU conversion, and GPU inference:
 	//
@@ -234,8 +244,8 @@ pub fn run(
 						frames_read, score, threshold
 					);
 					if score > threshold {
-						debug!(
-							"Scene cut at frame {} (score={:.3}, threshold={:.3})",
+						info!(
+							"Scene cut detected at frame {} (score={:.3}, threshold={:.3})",
 							frames_read, score, threshold
 						);
 						true

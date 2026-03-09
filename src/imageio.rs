@@ -1,6 +1,6 @@
 //! Image loading, saving, and path utilities.
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result};
 use image::DynamicImage;
 use std::path::{Path, PathBuf};
 
@@ -30,32 +30,6 @@ pub fn default_output_path(input: &Path, scale: u32) -> PathBuf {
 	parent.join(format!("{stem}_{scale}x.{ext}"))
 }
 
-/// Validate that the output path's extension matches the input's.
-///
-/// Returns `Ok` if extensions match (case-insensitive) or if the output
-/// has no extension (treated as a directory). Errors on mismatch because
-/// format conversion is not supported.
-pub fn check_extension_match(input: &Path, output: &Path) -> Result<()> {
-	let out_ext = match output.extension() {
-		Some(e) => e.to_string_lossy().to_lowercase(),
-		None => return Ok(()), // No extension → directory, OK
-	};
-	let in_ext = input
-		.extension()
-		.unwrap_or_default()
-		.to_string_lossy()
-		.to_lowercase();
-
-	if in_ext == out_ext {
-		Ok(())
-	} else {
-		bail!(
-			"Output extension '.{out_ext}' does not match input '.{in_ext}'. \
-			 Format conversion is not supported — use the same extension."
-		)
-	}
-}
-
 #[cfg(test)]
 mod tests {
 	use super::*;
@@ -72,25 +46,5 @@ mod tests {
 		let input = Path::new("test.jpg");
 		let result = default_output_path(input, 4);
 		assert_eq!(result.file_name().unwrap().to_str().unwrap(), "test_4x.jpg");
-	}
-
-	#[test]
-	fn extension_match_same() {
-		assert!(check_extension_match(Path::new("a.png"), Path::new("b.png")).is_ok());
-	}
-
-	#[test]
-	fn extension_match_case_insensitive() {
-		assert!(check_extension_match(Path::new("a.PNG"), Path::new("b.png")).is_ok());
-	}
-
-	#[test]
-	fn extension_match_no_output_ext() {
-		assert!(check_extension_match(Path::new("a.png"), Path::new("output_dir")).is_ok());
-	}
-
-	#[test]
-	fn extension_mismatch() {
-		assert!(check_extension_match(Path::new("a.png"), Path::new("b.jpg")).is_err());
 	}
 }

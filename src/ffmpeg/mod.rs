@@ -23,6 +23,45 @@ use tracing::{debug, info, warn};
 
 // ── Video metadata ─────────────────────────────────────────────────────────
 
+/// Supported output container formats.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ContainerFormat {
+	Matroska,
+	Mp4,
+	Webm,
+}
+
+impl ContainerFormat {
+	/// FFmpeg muxer name.
+	pub fn ffmpeg_format(self) -> &'static str {
+		match self {
+			Self::Matroska => "matroska",
+			Self::Mp4 => "mp4",
+			Self::Webm => "webm",
+		}
+	}
+
+	/// Canonical file extension.
+	pub fn extension(self) -> &'static str {
+		match self {
+			Self::Matroska => "mkv",
+			Self::Mp4 => "mp4",
+			Self::Webm => "webm",
+		}
+	}
+
+	/// Infer container format from a file extension.
+	///
+	/// Falls back to Matroska for unrecognised extensions.
+	pub fn from_extension(ext: &str) -> Self {
+		match ext.to_lowercase().as_str() {
+			"mp4" | "m4v" => Self::Mp4,
+			"webm" => Self::Webm,
+			_ => Self::Matroska,
+		}
+	}
+}
+
 /// Metadata extracted from a video file via `ffprobe`.
 pub struct VideoInfo {
 	/// Frames per second as a floating point value.
@@ -234,7 +273,7 @@ pub fn spawn_reader(input: &Path) -> Result<(Child, ChildStdout)> {
 	Ok((child, stdout))
 }
 
-/// Spawn an FFmpeg process that reads raw RGB24 frames from stdin and encodes to MKV.
+/// Spawn an FFmpeg process that reads raw RGB24 frames from stdin and encodes to video.
 ///
 /// Audio is intentionally omitted — call [`mux_audio_into`] after the run completes
 /// to add the source audio in a single lossless remux pass.
@@ -244,6 +283,7 @@ pub fn spawn_writer(
 	height: usize,
 	output_fps_str: &str,
 	crf: u32,
+	container: ContainerFormat,
 ) -> Result<(Child, ChildStdin)> {
 	let output_str = output
 		.to_str()
@@ -263,7 +303,7 @@ pub fn spawn_writer(
 	// Force a standard output pixel format so players can always read the file.
 	cmd.args(["-pix_fmt", "yuv420p"]);
 
-	if supports_nvenc() {
+	if supports_nvenc() && container != ContainerFormat::Webm {
 		info!("Hardware encoding: using hevc_nvenc (preset p4)");
 		cmd.args(["-c:v", "hevc_nvenc"]).args(["-preset", "p4"]);
 
@@ -274,6 +314,11 @@ pub fn spawn_writer(
 				.args(["-cq", &crf.to_string()])
 				.args(["-b:v", "0"]);
 		}
+	} else if container == ContainerFormat::Webm {
+		info!("WebM output: using libvpx-vp9");
+		cmd.args(["-c:v", "libvpx-vp9"])
+			.args(["-crf", &crf.to_string()])
+			.args(["-b:v", "0"]);
 	} else {
 		info!("Hardware encoding unavailable: falling back to libx264 (preset fast)");
 		cmd.args(["-c:v", "libx264"])
@@ -281,12 +326,12 @@ pub fn spawn_writer(
 			.args(["-crf", &crf.to_string()]);
 	}
 
-	// Isolate from Ctrl+C on Windows so FFmpeg can finalise the MKV container cleanly.
+	// Isolate from Ctrl+C on Windows so FFmpeg can finalise the container cleanly.
 	#[cfg(windows)]
 	cmd.creation_flags(CREATE_NEW_PROCESS_GROUP);
 
 	let mut child = cmd
-		.args(["-f", "matroska"])
+		.args(["-f", container.ffmpeg_format()])
 		.args(["-v", "quiet"])
 		.arg(output_str)
 		.stdin(Stdio::piped())
@@ -316,7 +361,12 @@ pub fn spawn_writer(
 /// to `output`. Uses stream copy (no re-encoding).
 ///
 /// If `source` has no audio stream, the video is copied to `output` unchanged.
-pub fn mux_audio_into(video: &Path, source: &Path, output: &Path) -> Result<()> {
+pub fn mux_audio_into(
+	video: &Path,
+	source: &Path,
+	output: &Path,
+	container: ContainerFormat,
+) -> Result<()> {
 	let video_str = video
 		.to_str()
 		.context("Video path contains invalid UTF-8")?;
@@ -334,7 +384,7 @@ pub fn mux_audio_into(video: &Path, source: &Path, output: &Path) -> Result<()> 
 		.args(["-map", "0:v"])
 		.args(["-map", "1:a?"])
 		.args(["-c", "copy"])
-		.args(["-f", "matroska"])
+		.args(["-f", container.ffmpeg_format()])
 		.args(["-v", "quiet"])
 		.arg(output_str)
 		.status()

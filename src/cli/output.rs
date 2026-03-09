@@ -34,8 +34,8 @@ pub const SPINNER_TICK_MS: u64 = 120;
 pub fn init_tracing() {
 	let indicatif_layer = IndicatifLayer::new();
 
-	let filter =
-		EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("sqwale=warn"));
+	let filter = EnvFilter::try_from_default_env()
+		.unwrap_or_else(|_| EnvFilter::new("sqwale=info,ort=warn"));
 
 	tracing_subscriber::registry()
 		.with(filter)

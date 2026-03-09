@@ -9,6 +9,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 use sqwale::ffmpeg;
+use sqwale::ffmpeg::ContainerFormat;
 use sqwale::interpolate::{self, InterpolateOptions, RifeSession};
 use sqwale::pipeline::CancelToken;
 use sqwale::session::ProviderSelection;
@@ -45,8 +46,8 @@ pub fn run(input: &str, output_arg: Option<&str>, ia: InterpolateArgs, args: &Cl
 		bail!("Multiplier must be a power of two (2, 4, 8, …), got {multiplier}");
 	}
 
-	// Resolve output path (always .mkv).
-	let output_path = resolve_output(input_path, output_arg, multiplier)?;
+	// Resolve output path and container format.
+	let (output_path, container) = resolve_output(input_path, output_arg, multiplier)?;
 
 	// Parse provider.
 	let provider: ProviderSelection = args.provider.parse().context("Invalid --provider value")?;
@@ -162,6 +163,7 @@ pub fn run(input: &str, output_arg: Option<&str>, ia: InterpolateArgs, args: &Cl
 		multiplier,
 		ensemble,
 		crf,
+		container,
 		scene_detect_threshold: scene_detect.then_some(scene_threshold),
 		cancel: cancel.clone(),
 		on_progress: Some(Box::new(move |done, total| {
@@ -187,8 +189,9 @@ pub fn run(input: &str, output_arg: Option<&str>, ia: InterpolateArgs, args: &Cl
 	// ── Post-run audio mux ───────────────────────────────────────────────
 	// The writer never copies audio; do a single lossless remux pass now.
 	if info.has_audio {
-		let muxed = output_path.with_extension("mkv.audio");
-		ffmpeg::mux_audio_into(&output_path, input_path, &muxed)
+		let mux_ext = format!("{}.audio", container.extension());
+		let muxed = output_path.with_extension(mux_ext);
+		ffmpeg::mux_audio_into(&output_path, input_path, &muxed, container)
 			.context("Failed to mux audio into output")?;
 		std::fs::rename(&muxed, &output_path)
 			.context("Failed to replace video-only output with muxed file")?;
@@ -227,27 +230,40 @@ pub fn run(input: &str, output_arg: Option<&str>, ia: InterpolateArgs, args: &Cl
 
 // ── Helpers ────────────────────────────────────────────────────────────────
 
-/// Resolve the output path, forcing `.mkv` extension.
-fn resolve_output(input: &Path, output_arg: Option<&str>, multiplier: u32) -> Result<PathBuf> {
-	let path = if let Some(out) = output_arg {
-		let mut p = PathBuf::from(out);
-		if p.extension().is_some_and(|ext| ext != "mkv") {
-			tracing::warn!(
-				"Output extension changed to .mkv (was .{})",
-				p.extension().unwrap().to_string_lossy()
-			);
-		}
-		p.set_extension("mkv");
-		p
+/// Resolve the output path and container format.
+///
+/// When `--output` is given, the container is inferred from its extension.
+/// When omitted, the output defaults to the input's container format.
+fn resolve_output(
+	input: &Path,
+	output_arg: Option<&str>,
+	multiplier: u32,
+) -> Result<(PathBuf, ContainerFormat)> {
+	if let Some(out) = output_arg {
+		let p = PathBuf::from(out);
+		let ext = p
+			.extension()
+			.unwrap_or_default()
+			.to_string_lossy()
+			.to_lowercase();
+		let container = ContainerFormat::from_extension(&ext);
+		// Normalise extension to the canonical form for the container.
+		let p = p.with_extension(container.extension());
+		Ok((p, container))
 	} else {
-		// Default: {stem}_{multiplier}x.mkv
+		// Default: {stem}_{multiplier}x.{input_ext_or_mkv}
 		let stem = input
 			.file_stem()
 			.context("Input has no file stem")?
 			.to_string_lossy();
+		let in_ext = input
+			.extension()
+			.unwrap_or_default()
+			.to_string_lossy()
+			.to_lowercase();
+		let container = ContainerFormat::from_extension(&in_ext);
 		let parent = input.parent().unwrap_or(Path::new("."));
-		parent.join(format!("{stem}_{multiplier}x.mkv"))
-	};
-
-	Ok(path)
+		let path = parent.join(format!("{stem}_{multiplier}x.{}", container.extension()));
+		Ok((path, container))
+	}
 }
