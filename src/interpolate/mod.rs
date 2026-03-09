@@ -13,7 +13,7 @@ use std::io::{BufReader, BufWriter, Write};
 use std::path::Path;
 use std::thread;
 use std::time::Instant;
-use tracing::{debug, info};
+use tracing::{debug, info, trace};
 
 use crate::ffmpeg;
 use crate::pipeline::CancelToken;
@@ -47,9 +47,20 @@ pub struct InterpolateOptions {
 	/// duplicated instead of running RIFE inference.
 	///
 	/// The threshold is a value in `[0.0, 1.0]` using the same mean-absolute-
-	/// difference formula as FFmpeg's `scdet` filter. `0.4` is a sensible
+	/// difference formula as FFmpeg's `scdet` filter. `0.1` is a sensible
 	/// default for hard scene cuts.
 	pub scene_detect_threshold: Option<f64>,
+
+	/// Source input frame index to start decoding from. Set to `> 0` when resuming
+	/// an interrupted run to skip already-processed input frames.
+	///
+	/// Must satisfy `start_frame == (output_frame_offset - 1) / multiplier`.
+	pub start_frame: usize,
+
+	/// Number of frames already present in the output file. When `> 0`, the
+	/// pipeline appends to the existing file (MPEG-TS append mode) and reports
+	/// progress starting from this offset.
+	pub output_frame_offset: usize,
 
 	/// Cooperative cancellation token.
 	pub cancel: CancelToken,
@@ -99,15 +110,22 @@ pub fn run(
 	);
 
 	// Spawn FFmpeg processes.
-	let (mut reader_child, reader_stdout) = ffmpeg::spawn_reader(input)?;
-	let (mut writer_child, writer_stdin) = ffmpeg::spawn_writer(
-		input,
-		output,
-		info.width,
-		info.height,
-		&out_fps_str,
-		options.crf,
-	)?;
+	let (mut reader_child, reader_stdout) = ffmpeg::spawn_reader_from(input, options.start_frame)?;
+	let (mut writer_child, writer_stdin) = if options.output_frame_offset > 0 {
+		// Append mode: shift output PTS so the new frames continue seamlessly.
+		let ts_offset_secs =
+			options.output_frame_offset as f64 / (info.fps * options.multiplier as f64);
+		ffmpeg::spawn_writer_append(
+			output,
+			info.width,
+			info.height,
+			&out_fps_str,
+			options.crf,
+			ts_offset_secs,
+		)?
+	} else {
+		ffmpeg::spawn_writer(output, info.width, info.height, &out_fps_str, options.crf)?
+	};
 
 	// Three-stage pipeline decouples I/O, CPU conversion, and GPU inference:
 	//
@@ -207,7 +225,11 @@ pub fn run(
 		// Pass the first frame through to the writer unchanged.
 		if write_tx.send(WriteTask::Raw(buf_a)).is_ok() {
 			frames_written += 1;
-			report_progress(&options.on_progress, frames_written, total_output_frames);
+			report_progress(
+				&options.on_progress,
+				frames_written + options.output_frame_offset,
+				total_output_frames,
+			);
 		} else {
 			inference_result = Err(anyhow::anyhow!("Writer channel closed unexpectedly"));
 		}
@@ -235,6 +257,10 @@ pub fn run(
 				.zip(options.scene_detect_threshold)
 				.is_some_and(|(prev, threshold)| {
 					let score = scene_score(prev, &buf_b);
+					trace!(
+						"Scene score frame {} (input): {:.4} (threshold={:.3})",
+						frames_read, score, threshold
+					);
 					if score > threshold {
 						debug!(
 							"Scene cut at frame {} (score={:.3}, threshold={:.3})",
@@ -259,7 +285,11 @@ pub fn run(
 							break 'outer;
 						}
 						frames_written += 1;
-						report_progress(&options.on_progress, frames_written, total_output_frames);
+						report_progress(
+							&options.on_progress,
+							frames_written + options.output_frame_offset,
+							total_output_frames,
+						);
 					}
 				}
 				*prev_buf.as_mut().unwrap() = buf_b.clone();
@@ -286,7 +316,11 @@ pub fn run(
 						break 'outer;
 					}
 					frames_written += 1;
-					report_progress(&options.on_progress, frames_written, total_output_frames);
+					report_progress(
+						&options.on_progress,
+						frames_written + options.output_frame_offset,
+						total_output_frames,
+					);
 				}
 
 				if let Some(ref mut pb) = prev_buf {
@@ -300,7 +334,11 @@ pub fn run(
 				break;
 			}
 			frames_written += 1;
-			report_progress(&options.on_progress, frames_written, total_output_frames);
+			report_progress(
+				&options.on_progress,
+				frames_written + options.output_frame_offset,
+				total_output_frames,
+			);
 
 			let infer_time = infer_start.elapsed();
 			debug!(

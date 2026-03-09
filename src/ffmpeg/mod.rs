@@ -8,6 +8,7 @@ use serde::Deserialize;
 use std::io::{BufRead, BufReader, Read};
 use std::path::Path;
 use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
+use std::thread;
 
 use tracing::{debug, info, warn};
 
@@ -158,6 +159,23 @@ pub fn probe(input: &Path) -> Result<VideoInfo> {
 	})
 }
 
+/// Pipe a child process's stderr to the tracing `debug!` macro.
+///
+/// Spawns a background thread that reads `stderr` line by line.
+/// Call this after taking all other handles from the child.
+macro_rules! pipe_stderr_to_debug {
+	($child:expr, $target:literal) => {
+		if let Some(stderr) = $child.stderr.take() {
+			thread::spawn(move || {
+				let reader = BufReader::new(stderr);
+				for line in reader.lines().map_while(Result::ok) {
+					debug!(target: $target, "{}", line);
+				}
+			});
+		}
+	};
+}
+
 /// Spawn an FFmpeg process that decodes all video frames to raw RGB24 on stdout.
 ///
 /// Uses GPU hardware acceleration (CUDA) for video decoding if available,
@@ -197,38 +215,108 @@ pub fn spawn_reader(input: &Path) -> Result<(Child, ChildStdout)> {
 		.take()
 		.context("Failed to capture FFmpeg reader stdout")?;
 
-	// Pipe stderr to tracing in a background thread.
-	if let Some(stderr) = child.stderr.take() {
-		std::thread::spawn(move || {
-			let reader = BufReader::new(stderr);
-			for line in reader.lines().map_while(Result::ok) {
-				debug!(target: "ffmpeg::reader", "{}", line);
-			}
-		});
-	}
+	pipe_stderr_to_debug!(&mut child, "ffmpeg::reader");
 
 	debug!("FFmpeg reader spawned for {:?}", input);
 	Ok((child, stdout))
 }
 
-/// Spawn an FFmpeg process that reads raw RGB24 frames from stdin and encodes to MKV.
+/// Spawn an FFmpeg process that reads raw RGB24 frames from stdin and encodes to MPEG-TS.
 ///
-/// If the original file has audio, it is copied into the output unchanged.
+/// Audio is intentionally omitted — call [`mux_audio_into`] after the run completes
+/// to add the source audio in a single lossless remux pass.
+///
+/// B-frames are disabled (`-bf 0`) so that any partial `.ts` can be resumed cleanly
+/// via [`spawn_writer_append`].
 pub fn spawn_writer(
-	input: &Path,
 	output: &Path,
 	width: usize,
 	height: usize,
 	output_fps_str: &str,
 	crf: u32,
 ) -> Result<(Child, ChildStdin)> {
-	let input_str = input
-		.to_str()
-		.context("Input path contains invalid UTF-8")?;
 	let output_str = output
 		.to_str()
 		.context("Output path contains invalid UTF-8")?;
 
+	let (mut child, stdin) =
+		build_writer_child(output_str, width, height, output_fps_str, crf, None)?;
+
+	// Pipe stderr to tracing in a background thread.
+	pipe_stderr_to_debug!(&mut child, "ffmpeg::writer");
+
+	debug!(
+		"FFmpeg writer spawned: {}×{} @ {} fps, CRF {}, output {:?}",
+		width, height, output_fps_str, crf, output
+	);
+	Ok((child, stdin))
+}
+
+/// Spawn an FFmpeg process that reads raw RGB24 frames from stdin and **appends** encoded
+/// MPEG-TS packets to an existing `.ts` file.
+///
+/// All output timestamps are offset by `ts_offset_secs` so the new packets continue
+/// seamlessly from the last frame in the existing file. A background thread forwards
+/// the child's stdout directly to the open file in append mode.
+pub fn spawn_writer_append(
+	append_to: &Path,
+	width: usize,
+	height: usize,
+	output_fps_str: &str,
+	crf: u32,
+	ts_offset_secs: f64,
+) -> Result<(Child, ChildStdin)> {
+	// Build the child writing to pipe:1 (stdout).
+	let (mut child, stdin) = build_writer_child(
+		"pipe:1",
+		width,
+		height,
+		output_fps_str,
+		crf,
+		Some(ts_offset_secs),
+	)?;
+
+	// Capture stdout and forward to the append file in a background thread.
+	let stdout = child
+		.stdout
+		.take()
+		.context("Failed to capture FFmpeg writer stdout for append")?;
+	let append_path = append_to.to_path_buf();
+	thread::spawn(move || {
+		let file = std::fs::OpenOptions::new()
+			.append(true)
+			.open(&append_path)
+			.expect("Cannot open output .ts for appending");
+		let mut src = BufReader::new(stdout);
+		let mut dst = std::io::BufWriter::new(file);
+		if let Err(e) = std::io::copy(&mut src, &mut dst) {
+			warn!(target: "ffmpeg::writer_append", "Append I/O error: {e}");
+		}
+	});
+
+	pipe_stderr_to_debug!(&mut child, "ffmpeg::writer");
+
+	debug!(
+		"FFmpeg append-writer spawned: {}×{} @ {} fps, CRF {}, ts_offset={:.3}s, append→{:?}",
+		width, height, output_fps_str, crf, ts_offset_secs, append_to
+	);
+	Ok((child, stdin))
+}
+
+/// Spawn an FFmpeg process that reads raw RGB24 frames from stdin, starting output
+/// timestamps at `start_frame` decoded from the input at the given seek point,
+/// and writes to a file from `start_frame`'s position.
+/// The raw writer that decodes from start_frame is for `spawn_reader_from`.
+///
+/// Internal helper shared by `spawn_writer` and `spawn_writer_append`.
+fn build_writer_child(
+	output_target: &str,
+	width: usize,
+	height: usize,
+	output_fps_str: &str,
+	crf: u32,
+	ts_offset_secs: Option<f64>,
+) -> Result<(Child, ChildStdin)> {
 	let size_arg = format!("{width}x{height}");
 
 	let mut cmd = Command::new("ffmpeg");
@@ -238,12 +326,9 @@ pub fn spawn_writer(
 		.args(["-s", &size_arg])
 		.args(["-r", output_fps_str])
 		.args(["-i", "-"])
-		.args(["-i", input_str])
-		.args(["-map", "0:v"])
-		.args(["-map", "1:a?"]);
+		.args(["-map", "0:v"]);
 
-	// ALWAYS force a standard output pixel format so players can read the file!
-	// (Note: This is applied to the output stream, not the raw input stream)
+	// Force a standard output pixel format so players can always read the file.
 	cmd.args(["-pix_fmt", "yuv420p"]);
 
 	if supports_nvenc() {
@@ -251,11 +336,10 @@ pub fn spawn_writer(
 		cmd.args(["-c:v", "hevc_nvenc"]).args(["-preset", "p4"]);
 
 		if crf == 0 {
-			// NVENC requires a specific tune flag for true lossless
+			// NVENC requires a specific tune flag for true lossless.
 			cmd.args(["-tune", "lossless"]);
 		} else {
-			// For standard NVENC, you must specify VBR rate control and remove bitrate limits
-			// for the -cq flag to actually be respected.
+			// VBR rate control: -cq is respected only when -b:v 0 removes the bitrate cap.
 			cmd.args(["-rc", "vbr"])
 				.args(["-cq", &crf.to_string()])
 				.args(["-b:v", "0"]);
@@ -267,12 +351,24 @@ pub fn spawn_writer(
 			.args(["-crf", &crf.to_string()]);
 	}
 
+	// Disable B-frames so any partial .ts can be resumed without GOP misalignment.
+	cmd.args(["-bf", "0"]);
+
+	// Apply PTS offset for append / continue mode.
+	if let Some(offset) = ts_offset_secs {
+		cmd.args(["-output_ts_offset", &format!("{offset:.6}")]);
+	}
+
 	let mut child = cmd
-		.args(["-c:a", "copy"])
+		.args(["-f", "mpegts"])
 		.args(["-v", "quiet"])
-		.arg(output_str)
+		.arg(output_target)
 		.stdin(Stdio::piped())
-		.stdout(Stdio::null())
+		.stdout(if ts_offset_secs.is_some() {
+			Stdio::piped() // append mode: capture stdout for the forwarding thread
+		} else {
+			Stdio::null()
+		})
 		.stderr(Stdio::piped())
 		.spawn()
 		.context(
@@ -285,21 +381,140 @@ pub fn spawn_writer(
 		.take()
 		.context("Failed to capture FFmpeg writer stdin")?;
 
-	// Pipe stderr to tracing in a background thread.
-	if let Some(stderr) = child.stderr.take() {
-		std::thread::spawn(move || {
-			let reader = BufReader::new(stderr);
-			for line in reader.lines().map_while(Result::ok) {
-				debug!(target: "ffmpeg::writer", "{}", line);
-			}
-		});
+	Ok((child, stdin))
+}
+
+/// Spawn an FFmpeg reader that begins decoding from `start_frame`, discarding all
+/// preceding frames via a `select` filter.
+///
+/// When `start_frame == 0` this is equivalent to [`spawn_reader`].
+///
+/// # Performance note
+/// All frames before `start_frame` are decoded (but not output). For very long
+/// videos with a late resume point this may take some time. A future optimisation
+/// would combine `-ss` fast-seek with a small sub-GOP `select` offset.
+pub fn spawn_reader_from(input: &Path, start_frame: usize) -> Result<(Child, ChildStdout)> {
+	if start_frame == 0 {
+		return spawn_reader(input);
+	}
+
+	let input_str = input
+		.to_str()
+		.context("Input path contains invalid UTF-8")?;
+
+	let mut cmd = Command::new("ffmpeg");
+
+	// CUDA hwaccel: frames are on CPU after decode, so the software `select` filter works.
+	if supports_nvenc() {
+		cmd.args(["-hwaccel", "cuda"]);
+	}
+
+	let select_expr = format!("select=gte(n\\,{start_frame})");
+	let mut child = cmd
+		.args(["-i", input_str])
+		.args(["-vf", &select_expr])
+		.args(["-f", "rawvideo"])
+		.args(["-pix_fmt", "rgb24"])
+		.args(["-v", "quiet"])
+		.arg("-")
+		.stdout(Stdio::piped())
+		.stderr(Stdio::piped())
+		.spawn()
+		.context(
+			"Failed to spawn FFmpeg reader. Is FFmpeg installed and on your PATH?\n\
+			 Download from: https://ffmpeg.org/download.html",
+		)?;
+
+	let stdout = child
+		.stdout
+		.take()
+		.context("Failed to capture FFmpeg reader stdout")?;
+
+	pipe_stderr_to_debug!(&mut child, "ffmpeg::reader");
+
+	debug!(
+		"FFmpeg seek-reader spawned for {:?}, start_frame={start_frame}",
+		input
+	);
+	Ok((child, stdout))
+}
+
+/// Mux the audio stream from `source` into `video_only_ts`, writing the combined result
+/// to `output`. Uses stream copy (no re-encoding).
+///
+/// If `source` has no audio stream, the video is copied to `output` unchanged.
+pub fn mux_audio_into(video_ts: &Path, source: &Path, output: &Path) -> Result<()> {
+	let video_str = video_ts
+		.to_str()
+		.context("Video path contains invalid UTF-8")?;
+	let source_str = source
+		.to_str()
+		.context("Source path contains invalid UTF-8")?;
+	let output_str = output
+		.to_str()
+		.context("Output path contains invalid UTF-8")?;
+
+	let status = Command::new("ffmpeg")
+		.arg("-y")
+		.args(["-i", video_str])
+		.args(["-i", source_str])
+		.args(["-map", "0:v"])
+		.args(["-map", "1:a?"])
+		.args(["-c", "copy"])
+		.args(["-f", "mpegts"])
+		.args(["-v", "quiet"])
+		.arg(output_str)
+		.status()
+		.context("Failed to run FFmpeg audio mux")?;
+
+	if !status.success() {
+		bail!(
+			"FFmpeg audio mux exited with status {}",
+			status.code().unwrap_or(-1)
+		);
 	}
 
 	debug!(
-		"FFmpeg writer spawned: {}×{} @ {} fps, CRF {}, output {:?}",
-		width, height, output_fps_str, crf, output
+		"Audio mux complete: {:?} + {:?} → {:?}",
+		video_ts, source, output
 	);
-	Ok((child, stdin))
+	Ok(())
+}
+
+/// Trim an MPEG-TS file to at most `frame_count` video frames, writing to `output`.
+/// Uses stream copy (no re-encoding). The input file is not modified.
+pub fn trim_to_frames(input: &Path, frame_count: usize, output: &Path) -> Result<()> {
+	let input_str = input
+		.to_str()
+		.context("Input path contains invalid UTF-8")?;
+	let output_str = output
+		.to_str()
+		.context("Output path contains invalid UTF-8")?;
+
+	let status = Command::new("ffmpeg")
+		.arg("-y")
+		.args(["-i", input_str])
+		.args(["-map", "0:v"])
+		.args(["-frames:v", &frame_count.to_string()])
+		.args(["-c", "copy"])
+		.args(["-f", "mpegts"])
+		.args(["-v", "quiet"])
+		.arg(output_str)
+		.status()
+		.context("Failed to run FFmpeg trim")?;
+
+	if !status.success() {
+		bail!(
+			"FFmpeg trim exited with status {}",
+			status.code().unwrap_or(-1)
+		);
+	}
+
+	debug!(
+		"Trim complete: {:?} → {frame_count} frames → {:?}",
+		input, output
+	);
+	Ok(())
 }
 
 /// Multiply a rational FPS string by an integer multiplier.

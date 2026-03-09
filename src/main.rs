@@ -43,6 +43,7 @@ fn main() -> Result<()> {
 			ensemble,
 			scene_detect,
 			scene_threshold,
+			resume,
 		} => {
 			cli::interpolate::run(
 				input,
@@ -53,6 +54,7 @@ fn main() -> Result<()> {
 					ensemble: *ensemble,
 					scene_detect: *scene_detect,
 					scene_threshold: *scene_threshold,
+					resume: *resume,
 				},
 				&args,
 			)?;
