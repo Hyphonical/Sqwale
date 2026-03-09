@@ -18,7 +18,9 @@ path = "src/lib.rs"
 
 [dependencies]
 # ── Model Loading & Inference ─────────────────────────────────────────────
-ort     = { version = "2.0.0-rc.12", features = ["api-24", "half"] }
+ort     = { version = "2.0.0-rc.12", features = [
+    "api-24", "half", "cuda", "tensorrt", "directml", "coreml", "xnnpack"
+] }
 ndarray = { version = "0.17", default-features = false }
 half    = "2"
 
@@ -37,7 +39,9 @@ ctrlc     = "3"
 
 # ── Logging ───────────────────────────────────────────────────────────────
 tracing            = "0.1"
-tracing-subscriber = { version = "0.3", default-features = false, features = ["env-filter", "fmt", "ansi"] }
+tracing-subscriber = { version = "0.3", default-features = false, features = [
+    "env-filter", "fmt", "ansi"
+] }
 tracing-indicatif  = "0.3"
 
 # ── Serialization ─────────────────────────────────────────────────────────
