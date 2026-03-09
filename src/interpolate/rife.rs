@@ -1,21 +1,9 @@
 //! RIFE 4.25 frame interpolation: ORT session wrapper, tensor conversion,
 //! and ensemble inference.
 //!
-//! Two model variants are embedded:
-//!
-//! | Flag      | Weights | Input dtype | Output dtype |
-//! |-----------|---------|-------------|---------------|
-//! | (default) | fp32    | `f32`       | `f32`         |
-//! | `--fp16`  | fp16    | `f16`       | `f16`         |
-//!
-//! The fp16 variant was exported with `keep_io_types=False`, so the ORT
-//! session strictly expects `f16` input and returns `f16` output. Conversion
-//! between the pipeline's `f32` storage and `f16` wire tensors is done inside
-//! [`RifeSession::run_once`].
-//!
 //! Input tensor layout: `(1, 7, H, W)` — channels 0–2 = frame0 RGB,
 //! 3–5 = frame1 RGB, 6 = timestep broadcast. H and W must be multiples of 32.
-//! Output: interpolated frame `(1, 3, H, W)`, always returned as `f32`.
+//! Output: interpolated frame `(1, 3, H, W)` as `f32`.
 
 use anyhow::{Result, bail};
 use ndarray::{Array4, Axis, concatenate, s};
@@ -26,15 +14,8 @@ use crate::pipeline::tensor::{crop_tensor, pad_tensor_mirror};
 use crate::pipeline::tiling::Padding;
 use crate::session::{ProviderSelection, make_ep};
 
-/// RIFE 4.25 embedded model bytes — standard float32 weights.
-const RIFE_FP32_MODEL_BYTES: &[u8] = include_bytes!("../../models/rife425_fp32_op21_slim.onnx");
-
-/// RIFE 4.25 embedded model bytes — fully fp16-quantized weights.
-///
-/// Exported with `keep_io_types=False`: the model strictly expects `f16`
-/// input tensors and returns `f16` output tensors. Conversion is performed
-/// by [`RifeSession::run_once`] so all other pipeline code stays `f32`.
-const RIFE_FP16_MODEL_BYTES: &[u8] = include_bytes!("../../models/rife425_fp16_op21_slim.onnx");
+/// RIFE 4.25 embedded model bytes.
+const RIFE_MODEL_BYTES: &[u8] = include_bytes!("../../models/rife425_fp32_op21_slim.onnx");
 
 /// Alignment requirement for RIFE spatial dimensions.
 const RIFE_ALIGNMENT: usize = 32;
@@ -42,21 +23,15 @@ const RIFE_ALIGNMENT: usize = 32;
 /// An ORT session loaded with the embedded RIFE 4.25 model.
 pub struct RifeSession {
 	session: Session,
-	/// Whether this session expects and produces `f16` tensors.
-	fp16: bool,
 }
 
 impl RifeSession {
 	/// Create a new RIFE session using the given execution provider.
 	///
-	/// When `fp16` is `true`, the fully-quantized model is loaded. Input tensors
-	/// are converted from `f32` to `f16` before each ORT call, and outputs are
-	/// converted back to `f32` afterwards. Ensemble mode works identically.
-	///
 	/// Reuses the same provider-fallback logic as the upscale pipeline.
-	pub fn new(provider: ProviderSelection, fp16: bool) -> Result<Self> {
-		let session = create_rife_session(provider, fp16)?;
-		Ok(Self { session, fp16 })
+	pub fn new(provider: ProviderSelection) -> Result<Self> {
+		let session = create_rife_session(provider)?;
+		Ok(Self { session })
 	}
 
 	/// Run a single interpolation between two frames at the given timestep.
@@ -115,21 +90,15 @@ impl RifeSession {
 		let combined = Array4::from_shape_vec((1, 7, padded_h, padded_w), combined_data)
 			.map_err(|e| anyhow::anyhow!("Failed to build combined tensor: {e}"))?;
 
-		// Run inference — convert to f16 wire type for the quantized model.
-		let outputs = if self.fp16 {
-			let f16_combined = combined.mapv(half::f16::from_f32);
-			let input_value = ort::value::Value::from_array(f16_combined)
-				.map_err(|e| anyhow::anyhow!("Failed to create ORT f16 value: {e}"))?;
-			self.session
-				.run(ort::inputs![input_value])
-				.map_err(|e| anyhow::anyhow!("RIFE inference failed: {e}"))?
-		} else {
-			let input_value = ort::value::Value::from_array(combined)
-				.map_err(|e| anyhow::anyhow!("Failed to create ORT value: {e}"))?;
-			self.session
-				.run(ort::inputs![input_value])
-				.map_err(|e| anyhow::anyhow!("RIFE inference failed: {e}"))?
-		};
+		// Create ORT input value.
+		let input_value = ort::value::Value::from_array(combined)
+			.map_err(|e| anyhow::anyhow!("Failed to create ORT value: {e}"))?;
+
+		// Run inference.
+		let outputs = self
+			.session
+			.run(ort::inputs![input_value])
+			.map_err(|e| anyhow::anyhow!("RIFE inference failed: {e}"))?;
 
 		// Extract output tensor.
 		let (_, output) = outputs
@@ -232,21 +201,12 @@ fn flip_horizontal(tensor: &Array4<f32>) -> Array4<f32> {
 }
 
 /// Extract the first output as an f32 `Array4` with shape `(1, C, H, W)`.
-///
-/// Handles both `f32` (standard model) and `f16` (quantized model) outputs.
 fn extract_output_f32(output: &ort::value::ValueRef<'_>) -> Result<Array4<f32>> {
 	if let Ok((shape, data)) = output.try_extract_tensor::<f32>() {
 		let dims: Vec<usize> = (**shape).iter().map(|&d| d as usize).collect();
 		return reshape_to_nchw(data.to_vec(), &dims);
 	}
-
-	if let Ok((shape, data)) = output.try_extract_tensor::<half::f16>() {
-		let dims: Vec<usize> = (**shape).iter().map(|&d| d as usize).collect();
-		let f32_data: Vec<f32> = data.iter().map(|v| v.to_f32()).collect();
-		return reshape_to_nchw(f32_data, &dims);
-	}
-
-	bail!("RIFE output is neither float32 nor float16")
+	bail!("RIFE output is not float32")
 }
 
 /// Reshape a flat `f32` buffer into an NCHW `Array4`, accepting 3-D or 4-D shapes.
@@ -261,16 +221,12 @@ fn reshape_to_nchw(data: Vec<f32>, dims: &[usize]) -> Result<Array4<f32>> {
 }
 
 /// Create an ORT session for the embedded RIFE model with provider fallback.
-fn create_rife_session(provider: ProviderSelection, fp16: bool) -> Result<Session> {
+fn create_rife_session(provider: ProviderSelection) -> Result<Session> {
 	use ort::session::builder::AutoDevicePolicy;
 	use tracing::warn;
 
-	let model_bytes: &[u8] = if fp16 {
-		RIFE_FP16_MODEL_BYTES
-	} else {
-		RIFE_FP32_MODEL_BYTES
-	};
-	let commit = |b: &mut ort::session::builder::SessionBuilder| b.commit_from_memory(model_bytes);
+	let commit =
+		|b: &mut ort::session::builder::SessionBuilder| b.commit_from_memory(RIFE_MODEL_BYTES);
 
 	// CPU inference: use all available cores for intra-op parallelism.
 	let configure_cpu =

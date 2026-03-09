@@ -94,8 +94,6 @@ pub enum Commands {
 
 		/// Add monochrome luma noise post-upscale to reduce the "plastic" AI look.
 		/// Scale is 0 to 100. (Recommended: 5 for subtle texture, 20 for heavy film grain).
-		///
-		/// [default: 0]
 		#[arg(long, default_value_t = 0, value_parser = parse_grain)]
 		grain: u8,
 	},
@@ -132,10 +130,5 @@ pub enum Commands {
 		/// Has no effect unless `--scene-detect` is also set.
 		#[arg(long, default_value_t = 0.4, value_parser = parse_scene_threshold)]
 		scene_threshold: f64,
-
-		/// Use the fp16-quantized RIFE model (lower VRAM, faster on compatible hardware).
-		/// Inputs and outputs remain float32; quantization is internal only.
-		#[arg(long)]
-		fp16: bool,
 	},
 }
