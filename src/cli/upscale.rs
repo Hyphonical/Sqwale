@@ -124,7 +124,9 @@ pub fn run(
 	} else {
 		// For a single file, probe it to see if it's a video.
 		let input = &inputs[0];
-		let is_video = ffmpeg::probe(input).is_ok();
+		let is_video = ffmpeg::probe(input)
+			.map(|info| !info.is_image)
+			.unwrap_or(false);
 
 		if is_video {
 			run_video(

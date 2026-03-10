@@ -76,6 +76,8 @@ pub struct VideoInfo {
 	pub height: usize,
 	/// Whether the file contains at least one audio stream.
 	pub has_audio: bool,
+	/// Whether the file is a static image (format_name == "image2").
+	pub is_image: bool,
 }
 
 // ── ffprobe JSON structures ────────────────────────────────────────────────
@@ -91,6 +93,8 @@ struct ProbeOutput {
 struct ProbeFormat {
 	#[serde(default)]
 	duration: Option<String>,
+	#[serde(default)]
+	format_name: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -192,9 +196,16 @@ pub fn probe(input: &Path) -> Result<VideoInfo> {
 		fps,
 	);
 
+	let is_image = probe
+		.format
+		.as_ref()
+		.and_then(|fmt| fmt.format_name.as_deref())
+		.map(|name| name == "image2")
+		.unwrap_or(false);
+
 	debug!(
-		"Probed video: {}×{}, {} fps ({}), ~{} frames, audio={}",
-		width, height, fps, fps_str, frame_count, has_audio
+		"Probed video: {}×{}, {} fps ({}), ~{} frames, audio={}, is_image={}",
+		width, height, fps, fps_str, frame_count, has_audio, is_image
 	);
 
 	Ok(VideoInfo {
@@ -204,6 +215,7 @@ pub fn probe(input: &Path) -> Result<VideoInfo> {
 		width,
 		height,
 		has_audio,
+		is_image,
 	})
 }
 
