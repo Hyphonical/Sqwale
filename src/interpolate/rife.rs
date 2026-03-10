@@ -5,14 +5,14 @@
 //! 3–5 = frame1 RGB, 6 = timestep broadcast. H and W must be multiples of 32.
 //! Output: interpolated frame `(1, 3, H, W)` as `f32`.
 
-use anyhow::{Result, bail};
+use anyhow::Result;
 use ndarray::{Array4, Axis, concatenate, s};
 use ort::session::Session;
 use ort::session::builder::GraphOptimizationLevel;
 use rayon::prelude::*;
 use tracing::info;
 
-use crate::pipeline::tensor::{crop_tensor, pad_tensor_mirror};
+use crate::pipeline::tensor::{crop_tensor, extract_output_f32, pad_tensor_mirror};
 use crate::pipeline::tiling::Padding;
 use crate::session::{ProviderSelection, SessionConfig, create_session};
 
@@ -30,6 +30,8 @@ pub struct RifeSession {
 	session: Session,
 	/// Whether this session uses the fp16 model variant.
 	fp16: bool,
+	/// Cached padding for the last-seen frame dimensions to avoid recomputation.
+	cached_padding: Option<(usize, usize, Padding)>,
 }
 
 impl RifeSession {
@@ -43,7 +45,7 @@ impl RifeSession {
 		let session = create_rife_session(provider, fp16)?;
 		let variant = if fp16 { "fp16" } else { "fp32" };
 		info!("RIFE 4.25 ({variant}) model loaded and optimized");
-		Ok(Self { session, fp16 })
+		Ok(Self { session, fp16, cached_padding: None })
 	}
 
 	/// Run a single interpolation between two frames at the given timestep.
@@ -62,23 +64,24 @@ impl RifeSession {
 		let h = frame0.shape()[2];
 		let w = frame0.shape()[3];
 
-		// Compute padding to align to RIFE_ALIGNMENT.
-		let pad_h = (RIFE_ALIGNMENT - (h % RIFE_ALIGNMENT)) % RIFE_ALIGNMENT;
-		let pad_w = (RIFE_ALIGNMENT - (w % RIFE_ALIGNMENT)) % RIFE_ALIGNMENT;
-
-		let padding = Padding {
-			top: 0,
-			left: 0,
-			bottom: pad_h as u32,
-			right: pad_w as u32,
+		// Use cached padding when dimensions match to skip recomputation.
+		let padding = match self.cached_padding {
+			Some((cw, ch, p)) if cw == w && ch == h => p,
+			_ => {
+				let pad_h = (RIFE_ALIGNMENT - (h % RIFE_ALIGNMENT)) % RIFE_ALIGNMENT;
+				let pad_w = (RIFE_ALIGNMENT - (w % RIFE_ALIGNMENT)) % RIFE_ALIGNMENT;
+				let p = Padding { top: 0, left: 0, bottom: pad_h as u32, right: pad_w as u32 };
+				self.cached_padding = Some((w, h, p));
+				p
+			}
 		};
 
 		// Pad both input frames.
 		let f0 = pad_tensor_mirror(frame0, padding);
 		let f1 = pad_tensor_mirror(frame1, padding);
 
-		let padded_h = h + pad_h;
-		let padded_w = w + pad_w;
+		let padded_h = h + padding.bottom as usize;
+		let padded_w = w + padding.right as usize;
 
 		// Build the combined (1,7,H,W) tensor in-place instead of
 		// allocating three separate arrays and concatenating.
@@ -118,13 +121,7 @@ impl RifeSession {
 				.map_err(|e| anyhow::anyhow!("RIFE inference failed: {e}"))?
 		};
 
-		// Extract output tensor.
-		let (_, output) = outputs
-			.iter()
-			.next()
-			.ok_or_else(|| anyhow::anyhow!("RIFE model produced no outputs"))?;
-
-		let raw = extract_output_f32(&output)?;
+		let raw = extract_output_f32(&outputs)?;
 
 		// Crop padding (scale = 1 for interpolation).
 		Ok(crop_tensor(raw.view(), padding, 1))
@@ -216,33 +213,6 @@ pub fn tensor_to_bytes(tensor: &Array4<f32>) -> Vec<u8> {
 /// Flip a `(1, C, H, W)` tensor horizontally (reverse the W axis).
 fn flip_horizontal(tensor: &Array4<f32>) -> Array4<f32> {
 	tensor.slice(s![.., .., .., ..;-1]).to_owned()
-}
-
-/// Extract the first output as an f32 `Array4` with shape `(1, C, H, W)`.
-///
-/// Handles both f32 and f16 output tensors.
-fn extract_output_f32(output: &ort::value::ValueRef<'_>) -> Result<Array4<f32>> {
-	if let Ok((shape, data)) = output.try_extract_tensor::<f32>() {
-		let dims: Vec<usize> = (**shape).iter().map(|&d| d as usize).collect();
-		return reshape_to_nchw(data.to_vec(), &dims);
-	}
-	if let Ok((shape, data)) = output.try_extract_tensor::<half::f16>() {
-		let dims: Vec<usize> = (**shape).iter().map(|&d| d as usize).collect();
-		let f32_data: Vec<f32> = data.iter().map(|v| v.to_f32()).collect();
-		return reshape_to_nchw(f32_data, &dims);
-	}
-	bail!("RIFE output is not float32 or float16")
-}
-
-/// Reshape a flat `f32` buffer into an NCHW `Array4`, accepting 3-D or 4-D shapes.
-fn reshape_to_nchw(data: Vec<f32>, dims: &[usize]) -> Result<Array4<f32>> {
-	match dims {
-		[n, c, h, w] => Array4::from_shape_vec((*n, *c, *h, *w), data)
-			.map_err(|e| anyhow::anyhow!("Failed to reshape RIFE output: {e}")),
-		[c, h, w] => Array4::from_shape_vec((1, *c, *h, *w), data)
-			.map_err(|e| anyhow::anyhow!("Failed to reshape RIFE output: {e}")),
-		_ => bail!("Unexpected RIFE output shape: {dims:?} (expected 3-D or 4-D)"),
-	}
 }
 
 /// Create an ORT session for the embedded RIFE model using shared session logic.

@@ -112,9 +112,7 @@ pub fn run(input: &str, output_arg: Option<&str>, ia: InterpolateArgs, args: &Cl
 			format!(
 				"{}{}",
 				format!(" {SYM_DOT} ").dimmed(),
-				"Slow-mo"
-					.truecolor(CLR_VALUE.0, CLR_VALUE.1, CLR_VALUE.2)
-					.to_string(),
+				"Slow-mo".truecolor(CLR_VALUE.0, CLR_VALUE.1, CLR_VALUE.2),
 			)
 		} else {
 			String::new()
@@ -203,10 +201,13 @@ pub fn run(input: &str, output_arg: Option<&str>, ia: InterpolateArgs, args: &Cl
 
 	// ── Post-run audio mux ───────────────────────────────────────────────
 	// The writer never copies audio; do a single lossless remux pass now.
+	// For slow-motion output the video is longer than the source, so the
+	// audio must be stretched to match — re-encode with atempo filter.
 	if info.has_audio {
 		let mux_ext = format!("{}.audio", container.extension());
 		let muxed = output_path.with_extension(mux_ext);
-		ffmpeg::mux_audio_into(&output_path, input_path, &muxed, container)
+		let tempo_factor = slow_mo.then(|| 1.0 / multiplier as f64);
+		ffmpeg::mux_audio_into(&output_path, input_path, &muxed, container, tempo_factor)
 			.context("Failed to mux audio into output")?;
 		std::fs::rename(&muxed, &output_path)
 			.context("Failed to replace video-only output with muxed file")?;

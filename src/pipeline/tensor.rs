@@ -3,6 +3,7 @@
 use anyhow::{Result, bail};
 use image::DynamicImage;
 use ndarray::{Array4, ArrayView4, s};
+use ort::session::SessionOutputs;
 
 use super::tiling::Padding;
 
@@ -16,38 +17,40 @@ pub fn image_to_tensor(image: &DynamicImage, channels: u32) -> Result<Array4<f32
 	match channels {
 		1 => {
 			let gray = image.to_luma8();
-			let mut tensor = Array4::<f32>::zeros((1, 1, h as usize, w as usize));
-			for y in 0..h as usize {
-				for x in 0..w as usize {
-					tensor[[0, 0, y, x]] = gray.get_pixel(x as u32, y as u32)[0] as f32 / 255.0;
-				}
+			let w = w as usize;
+			let h = h as usize;
+			let mut tensor = Array4::<f32>::zeros((1, 1, h, w));
+			for (i, &px) in gray.as_raw().iter().enumerate() {
+				tensor[[0, 0, i / w, i % w]] = px as f32 / 255.0;
 			}
 			Ok(tensor)
 		}
 		3 => {
 			let rgb = image.to_rgb8();
-			let mut tensor = Array4::<f32>::zeros((1, 3, h as usize, w as usize));
-			for y in 0..h as usize {
-				for x in 0..w as usize {
-					let p = rgb.get_pixel(x as u32, y as u32);
-					tensor[[0, 0, y, x]] = p[0] as f32 / 255.0;
-					tensor[[0, 1, y, x]] = p[1] as f32 / 255.0;
-					tensor[[0, 2, y, x]] = p[2] as f32 / 255.0;
-				}
+			let w = w as usize;
+			let h = h as usize;
+			let mut tensor = Array4::<f32>::zeros((1, 3, h, w));
+			for (i, chunk) in rgb.as_raw().chunks_exact(3).enumerate() {
+				let y = i / w;
+				let x = i % w;
+				tensor[[0, 0, y, x]] = chunk[0] as f32 / 255.0;
+				tensor[[0, 1, y, x]] = chunk[1] as f32 / 255.0;
+				tensor[[0, 2, y, x]] = chunk[2] as f32 / 255.0;
 			}
 			Ok(tensor)
 		}
 		4 => {
 			let rgba = image.to_rgba8();
-			let mut tensor = Array4::<f32>::zeros((1, 4, h as usize, w as usize));
-			for y in 0..h as usize {
-				for x in 0..w as usize {
-					let p = rgba.get_pixel(x as u32, y as u32);
-					tensor[[0, 0, y, x]] = p[0] as f32 / 255.0;
-					tensor[[0, 1, y, x]] = p[1] as f32 / 255.0;
-					tensor[[0, 2, y, x]] = p[2] as f32 / 255.0;
-					tensor[[0, 3, y, x]] = p[3] as f32 / 255.0;
-				}
+			let w = w as usize;
+			let h = h as usize;
+			let mut tensor = Array4::<f32>::zeros((1, 4, h, w));
+			for (i, chunk) in rgba.as_raw().chunks_exact(4).enumerate() {
+				let y = i / w;
+				let x = i % w;
+				tensor[[0, 0, y, x]] = chunk[0] as f32 / 255.0;
+				tensor[[0, 1, y, x]] = chunk[1] as f32 / 255.0;
+				tensor[[0, 2, y, x]] = chunk[2] as f32 / 255.0;
+				tensor[[0, 3, y, x]] = chunk[3] as f32 / 255.0;
 			}
 			Ok(tensor)
 		}
@@ -64,56 +67,55 @@ pub fn tensor_to_image(tensor: ArrayView4<f32>, channels: u32) -> Result<Dynamic
 
 	match channels {
 		1 => {
-			let mut img = image::GrayImage::new(w as u32, h as u32);
+			let mut img_raw = vec![0u8; h * w];
 			for y in 0..h {
+				let row = y * w;
 				for x in 0..w {
-					let v = tensor[[0, 0, y, x]].clamp(0.0, 1.0);
-					img.put_pixel(x as u32, y as u32, image::Luma([(v * 255.0 + 0.5) as u8]));
+					img_raw[row + x] =
+						(tensor[[0, 0, y, x]].clamp(0.0, 1.0) * 255.0 + 0.5) as u8;
 				}
 			}
-			Ok(DynamicImage::ImageLuma8(img))
+			let luma_image = image::GrayImage::from_raw(w as u32, h as u32, img_raw)
+				.ok_or_else(|| anyhow::anyhow!("Failed to create image from raw buffer"))?;
+			Ok(DynamicImage::ImageLuma8(luma_image))
 		}
 		3 => {
-			let mut img = image::RgbImage::new(w as u32, h as u32);
+			let mut img_raw = vec![0u8; h * w * 3];
 			for y in 0..h {
+				let row = y * w * 3;
 				for x in 0..w {
-					let r = tensor[[0, 0, y, x]].clamp(0.0, 1.0);
-					let g = tensor[[0, 1, y, x]].clamp(0.0, 1.0);
-					let b = tensor[[0, 2, y, x]].clamp(0.0, 1.0);
-					img.put_pixel(
-						x as u32,
-						y as u32,
-						image::Rgb([
-							(r * 255.0 + 0.5) as u8,
-							(g * 255.0 + 0.5) as u8,
-							(b * 255.0 + 0.5) as u8,
-						]),
-					);
+					let idx = row + x * 3;
+					img_raw[idx] =
+						(tensor[[0, 0, y, x]].clamp(0.0, 1.0) * 255.0 + 0.5) as u8;
+					img_raw[idx + 1] =
+						(tensor[[0, 1, y, x]].clamp(0.0, 1.0) * 255.0 + 0.5) as u8;
+					img_raw[idx + 2] =
+						(tensor[[0, 2, y, x]].clamp(0.0, 1.0) * 255.0 + 0.5) as u8;
 				}
 			}
-			Ok(DynamicImage::ImageRgb8(img))
+			let rgb_image = image::RgbImage::from_raw(w as u32, h as u32, img_raw)
+				.ok_or_else(|| anyhow::anyhow!("Failed to create image from raw buffer"))?;
+			Ok(DynamicImage::ImageRgb8(rgb_image))
 		}
 		4 => {
-			let mut img = image::RgbaImage::new(w as u32, h as u32);
+			let mut img_raw = vec![0u8; h * w * 4];
 			for y in 0..h {
+				let row = y * w * 4;
 				for x in 0..w {
-					let r = tensor[[0, 0, y, x]].clamp(0.0, 1.0);
-					let g = tensor[[0, 1, y, x]].clamp(0.0, 1.0);
-					let b = tensor[[0, 2, y, x]].clamp(0.0, 1.0);
-					let a = tensor[[0, 3, y, x]].clamp(0.0, 1.0);
-					img.put_pixel(
-						x as u32,
-						y as u32,
-						image::Rgba([
-							(r * 255.0 + 0.5) as u8,
-							(g * 255.0 + 0.5) as u8,
-							(b * 255.0 + 0.5) as u8,
-							(a * 255.0 + 0.5) as u8,
-						]),
-					);
+					let idx = row + x * 4;
+					img_raw[idx] =
+						(tensor[[0, 0, y, x]].clamp(0.0, 1.0) * 255.0 + 0.5) as u8;
+					img_raw[idx + 1] =
+						(tensor[[0, 1, y, x]].clamp(0.0, 1.0) * 255.0 + 0.5) as u8;
+					img_raw[idx + 2] =
+						(tensor[[0, 2, y, x]].clamp(0.0, 1.0) * 255.0 + 0.5) as u8;
+					img_raw[idx + 3] =
+						(tensor[[0, 3, y, x]].clamp(0.0, 1.0) * 255.0 + 0.5) as u8;
 				}
 			}
-			Ok(DynamicImage::ImageRgba8(img))
+			let rgba_image = image::RgbaImage::from_raw(w as u32, h as u32, img_raw)
+				.ok_or_else(|| anyhow::anyhow!("Failed to create image from raw buffer"))?;
+			Ok(DynamicImage::ImageRgba8(rgba_image))
 		}
 		n => bail!("Unsupported channel count for output: {n}"),
 	}
@@ -223,4 +225,61 @@ pub fn crop_tensor(tensor: ArrayView4<f32>, padding: Padding, scale: u32) -> Arr
 	tensor
 		.slice(s![.., .., top..top + crop_h, left..left + crop_w])
 		.to_owned()
+}
+
+/// Extract the first output tensor from ORT session results as an f32 NCHW `Array4`.
+///
+/// Handles f32 and f16 output dtypes, and coerces NHWC/CHW layouts to NCHW.
+pub fn extract_output_f32(outputs: &SessionOutputs<'_>) -> Result<Array4<f32>> {
+	let (_, output) = outputs
+		.iter()
+		.next()
+		.ok_or_else(|| anyhow::anyhow!("Model produced no outputs"))?;
+
+	// Try f32 first.
+	if let Ok((shape, data)) = output.try_extract_tensor::<f32>() {
+		let dims: Vec<usize> = (**shape).iter().map(|&d| d as usize).collect();
+		return coerce_to_nchw(data.to_vec(), &dims);
+	}
+
+	// Try f16.
+	if let Ok((shape, data)) = output.try_extract_tensor::<half::f16>() {
+		let dims: Vec<usize> = (**shape).iter().map(|&d| d as usize).collect();
+		let f32_data: Vec<f32> = data.iter().map(|v| v.to_f32()).collect();
+		return coerce_to_nchw(f32_data, &dims);
+	}
+
+	bail!("Unsupported output tensor dtype (expected float32 or float16)")
+}
+
+/// Reshape a flat data buffer into an NCHW `Array4<f32>`.
+///
+/// Handles:
+/// - 4-D NCHW `[N, C, H, W]` — used as-is.
+/// - 4-D NHWC `[N, H, W, C]` — detected when the last dim is ≤ 4 and the
+///   second dim is clearly spatial (> 4), then transposed to `[N, C, H, W]`.
+/// - 3-D CHW `[C, H, W]` — a batch dimension of 1 is prepended.
+fn coerce_to_nchw(data: Vec<f32>, dims: &[usize]) -> Result<Array4<f32>> {
+	match dims {
+		[d0, d1, d2, d3] => {
+			// Heuristic: if the last dim is a plausible channel count (≤ 4) and
+			// the second dim is clearly spatial (> 4), the layout is NHWC.
+			if *d3 <= 4 && *d1 > 4 {
+				let nhwc = Array4::from_shape_vec((*d0, *d1, *d2, *d3), data)
+					.map_err(|e| anyhow::anyhow!("Failed to create NHWC tensor: {e}"))?;
+				// Permute [N, H, W, C] → [N, C, H, W]
+				Ok(nhwc.permuted_axes([0, 3, 1, 2]).into_owned())
+			} else {
+				Array4::from_shape_vec((*d0, *d1, *d2, *d3), data)
+					.map_err(|e| anyhow::anyhow!("Failed to create NCHW tensor: {e}"))
+			}
+		}
+		[c, h, w] => Array4::from_shape_vec((1, *c, *h, *w), data)
+			.map_err(|e| anyhow::anyhow!("Failed to create CHW tensor: {e}")),
+		_ => bail!(
+			"Unsupported output tensor rank {} (expected 3-D or 4-D, shape: {:?})",
+			dims.len(),
+			dims
+		),
+	}
 }

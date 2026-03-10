@@ -628,7 +628,7 @@ fn run_video(
 	if info.has_audio {
 		let mux_ext = format!("{}.audio", container.extension());
 		let muxed = output_path.with_extension(mux_ext);
-		ffmpeg::mux_audio_into(&output_path, input, &muxed, container)
+		ffmpeg::mux_audio_into(&output_path, input, &muxed, container, None)
 			.context("Failed to mux audio into output")?;
 		std::fs::rename(&muxed, &output_path)
 			.context("Failed to replace video-only output with muxed file")?;

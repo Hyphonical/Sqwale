@@ -261,6 +261,7 @@ pub fn spawn_reader(input: &Path) -> Result<(Child, ChildStdout)> {
 	cmd.creation_flags(CREATE_NEW_PROCESS_GROUP);
 
 	let mut child = cmd
+		.arg("-nostdin") // Prevent FFmpeg from reading terminal input (avoids interactive hang).
 		.args(["-i", input_str])
 		.args(["-f", "rawvideo"])
 		.args(["-pix_fmt", "rgb24"])
@@ -310,8 +311,8 @@ pub fn spawn_writer(
 		.args(["-s", &size_arg])
 		.args(["-r", output_fps_str])
 		// Limit input buffering to prevent frame queue from consuming excessive RAM.
-		// Default is 8 frames; 16 is safer while still allowing pipeline efficiency.
-		.args(["-thread_queue_size", "16"])
+		// Default is 8 frames; 128 avoids blocking warnings on high-throughput 4K encoding.
+		.args(["-thread_queue_size", "128"])
 		.args(["-i", "-"])
 		.args(["-map", "0:v"]);
 
@@ -381,8 +382,13 @@ pub fn spawn_writer(
 	Ok((child, stdin))
 }
 
-/// Mux the audio stream from `source` into `video_only`, writing the combined result
-/// to `output`. Uses stream copy (no re-encoding).
+/// Mux the audio stream from `source` into `video`, writing the combined result
+/// to `output`.
+///
+/// When `tempo_factor` is `None`, audio is stream-copied losslessly.
+/// When `tempo_factor` is `Some(f)`, the audio is time-stretched by `f` using
+/// FFmpeg's `atempo` filter and re-encoded as AAC — use this for slow-motion
+/// output where the video duration is longer than the source.
 ///
 /// If `source` has no audio stream, the video is copied to `output` unchanged.
 pub fn mux_audio_into(
@@ -390,6 +396,7 @@ pub fn mux_audio_into(
 	source: &Path,
 	output: &Path,
 	container: ContainerFormat,
+	tempo_factor: Option<f64>,
 ) -> Result<()> {
 	let video_str = video
 		.to_str()
@@ -401,13 +408,28 @@ pub fn mux_audio_into(
 		.to_str()
 		.context("Output path contains invalid UTF-8")?;
 
-	let status = Command::new("ffmpeg")
-		.arg("-y")
+	let mut cmd = Command::new("ffmpeg");
+	cmd.arg("-y")
 		.args(["-i", video_str])
 		.args(["-i", source_str])
 		.args(["-map", "0:v"])
-		.args(["-map", "1:a?"])
-		.args(["-c", "copy"])
+		.args(["-map", "1:a?"]);
+
+	match tempo_factor {
+		None => {
+			cmd.args(["-c", "copy"]);
+		}
+		Some(factor) => {
+			// Chain atempo filters to stay within FFmpeg's [0.5, 100.0] per-instance limit.
+			let atempo = build_atempo_filter(factor);
+			debug!("Slow-motion audio stretch: factor={factor:.6}, filter={atempo:?}");
+			cmd.args(["-c:v", "copy"])
+				.args(["-af", &atempo])
+				.args(["-c:a", "aac"]);
+		}
+	}
+
+	let status = cmd
 		.args(["-f", container.ffmpeg_format()])
 		.args(["-v", "quiet"])
 		.arg(output_str)
@@ -426,6 +448,22 @@ pub fn mux_audio_into(
 		video, source, output
 	);
 	Ok(())
+}
+
+/// Build an FFmpeg `atempo` filter chain for the given playback factor.
+///
+/// Each `atempo` instance is restricted to `[0.5, 100.0]` by FFmpeg, so factors
+/// below 0.5 are decomposed into chained `atempo=0.5` stages (e.g., 4× slow-motion
+/// → `"atempo=0.5,atempo=0.5"`).
+fn build_atempo_filter(factor: f64) -> String {
+	let mut parts: Vec<String> = Vec::new();
+	let mut remaining = factor;
+	while remaining < 0.5 - f64::EPSILON {
+		parts.push("atempo=0.5".to_string());
+		remaining *= 2.0;
+	}
+	parts.push(format!("atempo={remaining}"));
+	parts.join(",")
 }
 
 /// Multiply a rational FPS string by an integer multiplier.
