@@ -60,6 +60,11 @@ pub struct InterpolateOptions {
 
 	/// Progress callback: `(frames_written, total_output_frames)`.
 	pub on_progress: Option<Box<dyn Fn(usize, usize) + Send + Sync>>,
+
+	/// When true, output frames at the original framerate instead of the multiplied rate,
+	/// creating a slow-motion effect. All interpolated frames are still generated and written,
+	/// but the output video will be 1/multiplier speed.
+	pub slow_mo: bool,
 }
 
 /// Result of a completed interpolation run.
@@ -83,11 +88,24 @@ pub fn run(
 ) -> Result<InterpolateResult> {
 	let info = ffmpeg::probe(input)?;
 
-	let out_fps_str = ffmpeg::multiply_fps(&info.fps_str, options.multiplier)?;
+	let out_fps_str = if options.slow_mo {
+		info.fps_str.clone()
+	} else {
+		ffmpeg::multiply_fps(&info.fps_str, options.multiplier)?
+	};
 
 	info!(
-		"Interpolation: {}×{} @ {} fps → {} fps ({}× multiplier)",
-		info.width, info.height, info.fps_str, out_fps_str, options.multiplier
+		"Interpolation: {}×{} @ {} fps → {} fps ({}× multiplier){}",
+		info.width,
+		info.height,
+		info.fps_str,
+		out_fps_str,
+		options.multiplier,
+		if options.slow_mo {
+			" [SLOW-MO]"
+		} else {
+			""
+		},
 	);
 
 	let frame_size = info.width * info.height * 3;

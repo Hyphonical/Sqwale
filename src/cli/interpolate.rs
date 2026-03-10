@@ -24,6 +24,7 @@ pub struct InterpolateArgs {
 	pub ensemble: bool,
 	pub scene_detect: bool,
 	pub scene_threshold: f64,
+	pub slow_mo: bool,
 }
 
 /// Run the interpolate command.
@@ -34,6 +35,7 @@ pub fn run(input: &str, output_arg: Option<&str>, ia: InterpolateArgs, args: &Cl
 		ensemble,
 		scene_detect,
 		scene_threshold,
+		slow_mo,
 	} = ia;
 	// Validate input file exists.
 	let input_path = Path::new(input);
@@ -79,7 +81,7 @@ pub fn run(input: &str, output_arg: Option<&str>, ia: InterpolateArgs, args: &Cl
 
 	// Configuration line.
 	let config_summary = format!(
-		"{}{}{}{}{}{}",
+		"{}{}{}{}{}{}{}",
 		format!("{multiplier}×").truecolor(CLR_VALUE.0, CLR_VALUE.1, CLR_VALUE.2),
 		format!(" {SYM_DOT} ").dimmed(),
 		format!("CRF {crf}").truecolor(CLR_VALUE.0, CLR_VALUE.1, CLR_VALUE.2),
@@ -102,6 +104,17 @@ pub fn run(input: &str, output_arg: Option<&str>, ia: InterpolateArgs, args: &Cl
 					CLR_VALUE.1,
 					CLR_VALUE.2
 				),
+			)
+		} else {
+			String::new()
+		},
+		if slow_mo {
+			format!(
+				"{}{}",
+				format!(" {SYM_DOT} ").dimmed(),
+				"Slow-mo"
+					.truecolor(CLR_VALUE.0, CLR_VALUE.1, CLR_VALUE.2)
+					.to_string(),
 			)
 		} else {
 			String::new()
@@ -173,6 +186,7 @@ pub fn run(input: &str, output_arg: Option<&str>, ia: InterpolateArgs, args: &Cl
 				pb.set_position(done as u64);
 			}
 		})),
+		slow_mo,
 	};
 
 	let result = interpolate::run(input_path, &output_path, &mut rife, &options);
@@ -198,7 +212,11 @@ pub fn run(input: &str, output_arg: Option<&str>, ia: InterpolateArgs, args: &Cl
 			.context("Failed to replace video-only output with muxed file")?;
 	}
 
-	let out_fps = info.fps * multiplier as f64;
+	let out_fps = if slow_mo {
+		info.fps
+	} else {
+		info.fps * multiplier as f64
+	};
 
 	println!(
 		"{}  {} {}  {}  {}",

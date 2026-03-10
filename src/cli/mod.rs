@@ -143,5 +143,12 @@ pub enum Commands {
 		/// Has no effect unless `--scene-detect` is also set.
 		#[arg(long, default_value_t = 0.1, value_parser = parse_scene_threshold)]
 		scene_threshold: f64,
+
+		/// Output slow-motion video at the original framerate while maintaining all
+		/// interpolated frames. The output video duration will be multiplied by the
+		/// frame rate multiplier. For example, 24fps --multiplier 4x with --slow-mo
+		/// will produce a ~4x slower video at 24fps with 4x the frame count.
+		#[arg(long)]
+		slow_mo: bool,
 	},
 }

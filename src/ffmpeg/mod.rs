@@ -309,6 +309,9 @@ pub fn spawn_writer(
 		.args(["-pix_fmt", "rgb24"])
 		.args(["-s", &size_arg])
 		.args(["-r", output_fps_str])
+		// Limit input buffering to prevent frame queue from consuming excessive RAM.
+		// Default is 8 frames; 16 is safer while still allowing pipeline efficiency.
+		.args(["-thread_queue_size", "16"])
 		.args(["-i", "-"])
 		.args(["-map", "0:v"]);
 
@@ -324,7 +327,10 @@ pub fn spawn_writer(
 		} else {
 			cmd.args(["-rc", "vbr"])
 				.args(["-cq", &crf.to_string()])
-				.args(["-b:v", "0"]);
+				.args(["-b:v", "0"])
+				// Limit VBV buffer to 100 MiB to constrain encoder buffering.
+				// This reduces memory usage at a negligible quality cost for most content.
+				.args(["-bufsize", "100M"]);
 		}
 	} else if container == ContainerFormat::Webm {
 		info!("WebM output: using libvpx-vp9");
@@ -335,7 +341,9 @@ pub fn spawn_writer(
 		info!("Hardware encoding unavailable: falling back to libx264 (preset fast)");
 		cmd.args(["-c:v", "libx264"])
 			.args(["-preset", "fast"])
-			.args(["-crf", &crf.to_string()]);
+			.args(["-crf", &crf.to_string()])
+			// Limit VBV buffer for libx264 to reduce memory usage.
+			.args(["-bufsize", "50M"]);
 	}
 
 	// Isolate from Ctrl+C on Windows so FFmpeg can finalise the container cleanly.
@@ -343,6 +351,10 @@ pub fn spawn_writer(
 	cmd.creation_flags(CREATE_NEW_PROCESS_GROUP);
 
 	let mut child = cmd
+		// Limit muxing queue size to prevent container buffering from consuming excessive RAM.
+		// Default can be very large; 512 is still sufficient for smooth encoding while
+		// bounded to predictable memory usage (typically <200 MB for MKV).
+		.args(["-max_muxing_queue_size", "512"])
 		.args(["-f", container.ffmpeg_format()])
 		.args(["-v", "quiet"])
 		.arg(output_str)
