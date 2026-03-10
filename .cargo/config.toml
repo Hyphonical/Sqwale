@@ -1,0 +1,7 @@
+[build]
+# Enable AVX2 auto-vectorization on all CPU scalar loops.
+# x86-64-v3 baseline covers ~95% of modern x86-64 systems and includes:
+# - SSE, SSE2, SSE3, SSSE3, SSE4.1, SSE4.2
+# - AVX, AVX2
+# For broader compatibility (older chips), use "x86-64-v2" instead.
+rustflags = ["-C", "target-cpu=x86-64-v3"]
